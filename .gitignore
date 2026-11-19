@@ -64,3 +64,8 @@ native/*.pdb
 native/*.lib
 native/pka_channel_key.txt
 native/exec-result.json
+
+# Rascunhos de debug dos agentes
+.tmp_*
+*.tmp
+

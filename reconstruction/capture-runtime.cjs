@@ -25,6 +25,7 @@ class CaptureRuntime {
       return null;
     };
     if (!settings.enabled) { this.last = { status: 'off', effectVerified: false }; return null; }
+    if (options.canCapture === false) return block('capture-command-unavailable');
     if (!Number.isFinite(now) || !validPosition(telemetry?.position)) return block('capture-position');
     if (telemetry.captureVersion !== 1 || telemetry.itemInspectorAvailable !== true) return block('capture-source-unavailable');
     if (telemetry.itemsComplete === false || !Array.isArray(telemetry.items)) return block('capture-items-incomplete');

@@ -353,18 +353,29 @@ test('healer item channel follows the engine: hotkey first, no silent fallback',
   const withHotkey = capabilities.requirementsFor(['healer'], {
     healer: {}, hoenn: { potionHpPercent: 60, potionHotkey: 'F3', potionActionBar: 3 } });
   assert.ok(withHotkey.commands.includes('hotkey'));
-  assert.ok(!withHotkey.commands.includes('action'), 'com hotkey nao exige action');
+  assert.ok(!withHotkey.commands.includes('potion'), 'com hotkey nao exige potion');
 
-  /* Sem hotkey, com slot -> `action` (o motor usa o slot). */
+  /* Sem hotkey, com slot -> `potion` numerico. */
   const withSlot = capabilities.requirementsFor(['healer'], {
     healer: {}, hoenn: { potionHpPercent: 60, potionHotkey: '', potionActionBar: 3 } });
-  assert.ok(withSlot.commands.includes('action'));
+  assert.ok(withSlot.commands.includes('potion'));
+  assert.ok(!withSlot.commands.includes('action'));
 
-  /* Nenhum canal -> o motor nao emite, entao nao exigimos nada de item. */
+  /* Nenhum canal de potion -> o motor nao emite potion. */
   const none = capabilities.requirementsFor(['healer'], {
-    healer: {}, hoenn: { potionHpPercent: 60, potionHotkey: '', potionActionBar: 0 } });
+    healer: {}, hoenn: { potionHpPercent: 60, potionHotkey: '', potionActionBar: 0,
+      useMedicine: false } });
   assert.ok(!none.commands.includes('action'));
-  assert.ok(!none.commands.includes('hotkey'));
+  assert.ok(!none.commands.includes('potion'));
+
+  /* Medicine ligada SEM hotkey: exige `hotkey` no start. Medicine nao tem
+   * fallback numerico; sem isso o motor so' bloqueia a cada tick. */
+  const medicineMissing = capabilities.requirementsFor(['healer'], {
+    healer: {}, hoenn: { potionHpPercent: 0, useMedicine: true, medicineHotkey: '' } });
+  assert.ok(medicineMissing.commands.includes('hotkey'));
+  const medicineOk = capabilities.requirementsFor(['healer'], {
+    healer: {}, hoenn: { potionHpPercent: 0, useMedicine: true, medicineHotkey: 'F4' } });
+  assert.ok(medicineOk.commands.includes('hotkey'));
 });
 
 test('requirements do not ask for commands the configuration does not use', () => {
@@ -391,15 +402,12 @@ test('requirements do not ask for commands the configuration does not use', () =
   assert.ok(stop.commands.includes('talk'), 'PokeStop usa talk');
 });
 
-test('capture requires useWith, which our server does not implement', () => {
+test('capture capability does not block target activation', () => {
   const { requirements } = capabilities.requirementsFor(['target'], {
     target: { monsters: [], luring: {} }, looting: { captureEnabled: true } });
-  const capture = requirements.find(entry => entry.feature === 'capture');
-  assert.ok(capture, 'captura precisa ser apontada');
-  assert.deepEqual(capture.commands, ['useWith']);
   const missing = capabilities.evaluate(requirements, capabilities.parseDeclaration(NATIVE_DECLARATION));
-  assert.equal(missing.ok, false);
-  assert.ok(missing.missing.some(entry => entry.feature === 'capture'));
+  assert.equal(missing.ok, true);
+  assert.ok(!requirements.some(entry => entry.commands.includes('useWith')));
 });
 
 test('luring mode comes from normalizeLuring, not a local copy', () => {

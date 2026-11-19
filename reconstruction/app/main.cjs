@@ -316,6 +316,7 @@ const ready = app.whenReady().then(async () => {
   const keyboardWalker = useKeyboardWalker(process.env, audit || smoke, simEnabled);
   keyboardBackend = keyboardWalker && !smoke;
   engineRuntime = smoke ? null : keyboardWalker ? new RpmCombatRuntime({
+    mapProvider: () => loadDefaultMap(),
     getSession: () => getLiveSessions()[0] || null,
     playerName: process.env.PKA_PLAYER_NAME,
     creatureSource: createCreatureSource(CREATURES_FILE),
@@ -324,6 +325,10 @@ const ready = app.whenReady().then(async () => {
     onDispatch: record => fs.appendFileSync(path.join(dataRoot, 'combat-dispatch.jsonl'), JSON.stringify(record) + '\n'),
   }) : new EngineRuntime({
     creatureSource: process.env.PKA_CREATURES_FILE ? createCreatureSource(process.env.PKA_CREATURES_FILE) : undefined,
+    /* Mapa para o pathfinding do walker. `activeMap` e' o mapa carregado na
+     * aba do menu; sem ele, tenta o padrao. Falha de leitura nao derruba a
+     * automacao: o walker so' cai no guloso. */
+    mapProvider: simEnabled ? undefined : () => loadDefaultMap(),
     openAdapter: options => (simEnabled ? simulation.open(options) : nativeAdapter.open(options)),
   });
   monitor = createMonitorRuntime({

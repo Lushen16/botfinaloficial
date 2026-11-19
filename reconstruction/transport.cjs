@@ -144,14 +144,22 @@ class Transport extends EventEmitter {
       if (body && typeof body === 'object' && body.capabilities !== undefined) {
         this.emit('declaration', body.capabilities);
       }
+      /* 'frame' continua valendo para TODA mensagem, mesmo as que ganharam
+       * evento dedicado. `botfinal/core/pipe-transport.cjs` repassa 'frame' e
+       * depende dele para aprender o `boot` do kind 6; quando kind 6 passou a
+       * sair por 'automation' e retornar aqui, a suite do botfinal ficou
+       * vermelha (3 testes de automation_native_loop). */
+      this.emit('frame', item);
       return;
     }
     if (item.kind === KIND.automation_revoked) {
       this.emit('automation-revoked', item.payload.toString('utf8'));
+      this.emit('frame', item);
       return;
     }
     if (item.kind === KIND.startup) {
       this.emit('startup', item.payload.toString('utf8'));
+      this.emit('frame', item);
       return;
     }
     this.emit('frame', item);

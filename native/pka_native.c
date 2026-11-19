@@ -351,6 +351,88 @@ static int mem_read(uint64_t addr, void *out, size_t size)
     return ReadProcessMemory(g_proc, (LPCVOID)(uintptr_t)addr, out, size, &got) && got == size;
 }
 
+/* Le o nome de uma ENTIDADE a partir do campo `name`.
+ *
+ * BUG CORRIGIDO (G05, 2026-11-17): o campo e' um `std::string` do MSVC, NAO um
+ * buffer inline de 32 bytes. Layout do objeto (medido no PID 27412, build
+ * 48c41bd4):
+ *
+ *   +0x70  union { char buf[16]; char *ptr; }   <- SSO ou ponteiro
+ *   +0x78  size_t size
+ *   +0x80  size_t capacity
+ *
+ * Com capacity <= 15 o texto vive em +0x70 (SSO) e o ler inline funciona. Com
+ * capacity >= 16 o texto esta' no heap e +0x70 e' um PONTEIRO.
+ *
+ * MEDIDO (duas formas no MESMO build 48c41bd4, personagens diferentes):
+ *
+ *   - PID 27412, nome de 16 chars: capacity=31, size>0, ptr=0x2012abb0a10;
+ *   - PID 9500,  "Banedenovootario": ptr=0x28ebf07f610, size=0, cap=16, texto
+ *     no ponteiro e terminado em NUL.
+ *
+ * Exigir `size > 0` reprovava o segundo caso: caia no ramo SSO, lia os bytes do
+ * ponteiro (`10 f6 07 bf`) e devolvia 0. O jogador em (3289,2113) hp 100 nao era
+ * aceito e a DLL publicava (0,0,0) `online=0` mesmo com `gate=1`. `size` agora
+ * e' opcional; `cap` limita a leitura.
+ *
+ * Ler inline devolvia bytes de ponteiro, `layout_looks_sane` reprovava o nome e
+ * NENHUM layout era aceito — a DLL caia no scanner por nome e aceitava falsos
+ * positivos (um buffer com a string "chaseMode" em +0x30), publicando posicao
+ * (0,0,0) e hp 0 com o runtime pronto (`gate=1`). O nome anterior tinha 14
+ * chars e cabia no SSO: o defeito so' apareceu ao trocar de personagem.
+ *
+ * Regra: se `capacity` estiver num intervalo plausivel e >= 16, seguir o
+ * ponteiro; caso contrario ler inline. Nunca devolve lixo: se o ponteiro nao
+ * for legivel ou o texto nao for imprimivel, devolve 0.
+ */
+static int read_name_from(const uint8_t *raw, size_t len, uint32_t off, char out[33])
+{
+    out[0] = 0;
+    if ((size_t)off + 0x18 > len) return 0;
+
+    uint64_t ptr = 0;
+    size_t size = 0, cap = 0;
+    memcpy(&ptr, raw + off, 8);
+    memcpy(&size, raw + off + 8, sizeof size);
+    memcpy(&cap, raw + off + 0x10, sizeof cap);
+
+    /* 15/16 e' a fronteira do SSO. Acima disso os dados estao no heap.
+     *
+     * CORRECAO 2026-11-18 (PID 9500, mesmo build): o objeto trazia
+     * ptr=0x28ebf07f610, size=0, cap=16 e o texto terminado em NUL no
+     * ponteiro. Exigir size>0 reprovava o jogador em (3289,2113) hp 100 — a
+     * DLL publicava (0,0,0) e online=0. `size` agora e' opcional. */
+    if (cap >= 16 && cap <= 4096) {
+        size_t want;
+        if (size > 0 && size <= 32) want = size;
+        else want = cap < 32 ? cap : 32;
+        if (want == 0) return 0;
+        char heap[33];
+        if (!mem_read(ptr, heap, want)) return 0;
+        heap[want] = 0;
+        size_t n = 0;
+        while (n < want && heap[n]) {
+            unsigned char c = (unsigned char)heap[n];
+            if (c < 0x20 || c > 0x7e) return 0;
+            out[n] = heap[n];
+            n++;
+        }
+        out[n] = 0;
+        return n > 0;
+    }
+
+    /* SSO: o texto esta' inline, no maximo 15 bytes + terminador. */
+    size_t n = 0;
+    while (n < 32 && raw[off + n]) {
+        unsigned char c = raw[off + n];
+        if (c < 0x20 || c > 0x7e) return 0;
+        out[n] = (char)c;
+        n++;
+    }
+    out[n] = 0;
+    return n > 0;
+}
+
 /* Escrita em memoria ALHEIA ao proprio objeto.
  *
  * Usado APENAS pelo comando attack, para publicar o alvo em
@@ -455,14 +537,11 @@ static int layout_looks_sane(const uint8_t *raw, size_t len,
     if (x <= 0 || y <= 0 || x > 65535 || y > 65535) return 0;
     uint8_t z = raw[l->pos + 8];
     if (z > 15) return 0;
-    const char *nm = (const char *)(raw + l->name);
-    size_t n = 0;
-    while (n < 32 && nm[n]) {
-        unsigned char c = (unsigned char)nm[n];
-        if (c < 0x20 || c > 0x7e) return 0;
-        n++;
-    }
-    if (n < 1) return 0;
+    /* O nome e' std::string (SSO ou heap). Antes exigia texto inline, o que
+     * reprovava qualquer personagem com nome > 15 chars e impedia o layout
+     * de ser aceito. */
+    char nm[33];
+    if (!read_name_from(raw, len, l->name, nm)) return 0;
     if (l->hp < len && raw[l->hp] > 100) return 0;
     uint64_t vt = 0;
     memcpy(&vt, raw, 8);
@@ -512,8 +591,8 @@ static int entity_read(uint64_t va, entity_t *e)
     memcpy(&e->y, raw + L->pos + 4, 4);
     memcpy(&e->z, raw + L->pos + 8, 2);
     memcpy(&e->id, raw + L->id, 4);
-    memcpy(e->name, raw + L->name, 32);
-    e->name[32] = 0;
+    /* O campo `name` e' std::string (SSO/heap), nao buffer inline. */
+    if (!read_name_from(raw, sizeof raw, L->name, e->name)) e->name[0] = 0;
     e->hp = raw[L->hp];
     e->type = raw[L->type];
     e->canAttack = (e->type == 1 && e->hp > 0);
@@ -532,9 +611,7 @@ static int name_matches(const uint8_t *raw, const char *wanted)
 {
     char name[33];
     uint32_t nameOff = g_layoutResolved ? g_layout.name : LAYOUT_NAME_DEFAULT;
-    memcpy(name, raw + nameOff, 32);
-    name[32] = 0;
-    if (!name[0]) return 0;
+    if (!read_name_from(raw, 0x200, nameOff, name)) return 0;
     return _stricmp(name, wanted) == 0;
 }
 
@@ -825,6 +902,9 @@ static uint64_t module_base_for_chain(void)
 /* build 48c41bd4 (2026-11-09) — confirmado por RTTI e pelo global do
  * LocalPlayer em docs/POSICAO_CONFIRMADA.md */
 #define PLAYER_VTABLE_RVA_48C41BD4 0x1FB5660ULL
+/* build 2026-11-19 (cliente atualizado pelo launcher) — vtable do objeto em
+ * [runtime+0x2528], com posicao em +0x20 lendo (957,1405) do personagem */
+#define PLAYER_VTABLE_RVA_20261119 0x1FDB2A8ULL
 
 typedef struct { uint32_t rva; uint8_t offCount; uint16_t offsets[4]; } player_chain16_t;
 
@@ -1051,7 +1131,8 @@ static uint64_t resolve_player_vtable(void)
     static uint64_t cached = 0;
     if (cached) return cached;
 
-    const uint64_t shortcuts[] = { PLAYER_VTABLE_RVA_48C41BD4,
+    const uint64_t shortcuts[] = { PLAYER_VTABLE_RVA_20261119,
+                                   PLAYER_VTABLE_RVA_48C41BD4,
                                    PLAYER_VTABLE_RVA_82EADEDC,
                                    PLAYER_VTABLE_RVA_473DF25C };
     for (size_t i = 0; i < sizeof shortcuts / sizeof shortcuts[0]; i++) {
@@ -1288,7 +1369,7 @@ static void refresh_state(void)
     if (g_playerVa) {
         uint64_t baseLp = module_base_for_chain();
         uint64_t globalLp = 0;
-        if (baseLp && mem_read(baseLp + 0x39cb958ULL, &globalLp, sizeof globalLp)
+        if (baseLp && mem_read(baseLp + 0x39F8E08ULL, &globalLp, sizeof globalLp)
             && globalLp && globalLp != g_playerVa) {
             log_line("player VA stale (cache=%#llx global=%#llx); re-resolvendo",
                      (unsigned long long)g_playerVa, (unsigned long long)globalLp);
@@ -1453,9 +1534,63 @@ static int g_creatureCount = 0;
  * PONTEIRO da entidade (nao o id), entao guardar o VA evita relocalizar. */
 static uint64_t g_creatureVa[MAX_CREATURES];
 
+/* --------------------------------------------------------- corpos (captura)
+ * O pulso nao publica itens nem corpos: o jogo so' mantem a criatura enquanto
+ * viva. Para o consumidor poder capturar, guardamos o ULTIMO tile de cada
+ * selvagem que sumiu da varredura e publicamos como `items[]`
+ * (`corpseId` = id da criatura, que e' o alvo de `useWith`).
+ *
+ * Medido em 2026-11-19: o alvo some do array ao morrer e nada era publicado
+ * para ele. TTL de 60 s cobre o atraso tipico de captura. */
+#define MAX_CORPSES 64
+#define CORPSE_TTL_MS 60000ULL
+typedef struct { uint32_t id; int32_t x, y; uint8_t z; ULONGLONG at; } corpse_t;
+static corpse_t g_corpses[MAX_CORPSES];
+static int g_corpseCount = 0;
+
+static void corpse_forget_expired(void)
+{
+    ULONGLONG now = GetTickCount64();
+    int w = 0;
+    for (int i = 0; i < g_corpseCount; i++) {
+        if (now - g_corpses[i].at > CORPSE_TTL_MS) continue;
+        if (w != i) g_corpses[w] = g_corpses[i];
+        w++;
+    }
+    g_corpseCount = w;
+}
+
+static void corpse_record(uint32_t id, int32_t x, int32_t y, uint8_t z)
+{
+    corpse_forget_expired();
+    for (int i = 0; i < g_corpseCount; i++) {
+        if (g_corpses[i].id == id) { g_corpses[i].at = GetTickCount64(); return; }
+    }
+    int slot;
+    if (g_corpseCount < MAX_CORPSES) slot = g_corpseCount++;
+    else {
+        slot = 0;
+        for (int i = 1; i < g_corpseCount; i++)
+            if (g_corpses[i].at < g_corpses[slot].at) slot = i;
+    }
+    g_corpses[slot].id = id;
+    g_corpses[slot].x = x;
+    g_corpses[slot].y = y;
+    g_corpses[slot].z = z;
+    g_corpses[slot].at = GetTickCount64();
+}
+
+static const corpse_t *corpse_find(uint32_t id)
+{
+    corpse_forget_expired();
+    for (int i = 0; i < g_corpseCount; i++)
+        if (g_corpses[i].id == id) return &g_corpses[i];
+    return NULL;
+}
+
 /* Runtime do jogo: objeto ESTATICO em .data (nao e' ponteiro).
  * Medido em 2026-11-09 (PID 7368): [runtime+0x2528] = LocalPlayer. */
-#define RUNTIME_RVA 0x39c9430ULL
+#define RUNTIME_RVA 0x39F68E0ULL
 
 /* Game::walk — build 48c41bd4 (2026-11-09/10).
  * Prologo conferido ao vivo: 48 89 5c 24 08 55 56 57 41 56 41 57 ...
@@ -1500,11 +1635,11 @@ static uint64_t g_creatureVa[MAX_CREATURES];
  * gates e o mesmo tipo de argumento. */
 #define TEXT_FN_RVA 0x785050ULL
 /* Global do objeto de sessao usado em rcx (e recarregado dentro do consumidor). */
-#define TEXT_CTX_RVA 0x39cb998ULL
+#define TEXT_CTX_RVA 0x39F8E48ULL
 /* Gate de sessao: precisa ser != 0 (medido: 1). */
-#define TEXT_GATE_RVA 0x39cba98ULL
+#define TEXT_GATE_RVA 0x39F8F48ULL
 /* Flag de reentrada: precisa ser 0. */
-#define TEXT_REENTRY_RVA 0x39cba9aULL
+#define TEXT_REENTRY_RVA 0x39F8F4AULL
 
 /* ─── INTERPRETADOR DE "!autocombo" (exe+0x67fbf0) ───
  *
@@ -1870,6 +2005,21 @@ static void scan_creatures(void)
     }
     free(buf);
 
+    /* corpos: selvagem que sumiu da varredura (ou veio com hp 0) vira
+     * candidato de captura no ultimo tile conhecido. Nao depende de lista de
+     * itens, que este build nao expoe. */
+    for (int i = 0; i < g_creatureCount; i++) {
+        if (g_creatures[i].type != CREATURE_TYPE_WILD) continue;
+        int still = 0;
+        for (int k = 0; k < foundCount; k++)
+            if (found[k].id == g_creatures[i].id) { still = 1; break; }
+        if (!still) corpse_record(g_creatures[i].id, g_creatures[i].x,
+                                  g_creatures[i].y, g_creatures[i].z);
+    }
+    for (int k = 0; k < foundCount; k++)
+        if (found[k].type == CREATURE_TYPE_WILD && found[k].hp == 0)
+            corpse_record(found[k].id, found[k].x, found[k].y, found[k].z);
+
     /* publica de forma atomica: atualiza o global so' quando terminou */
     if (foundCount > 0) {
         memcpy(g_creatures, found, sizeof(creature_t) * (size_t)foundCount);
@@ -1949,7 +2099,25 @@ static int creatures_json(char *dst, size_t cap)
     return n;
 }
 
-/* telemetria minima valida contra decodeTelemetry (schema 2, pulseVersion 3). */
+/* corpos observados, no formato que o consumidor de captura le:
+ * {"id","corpseId","stack","pos"}. `stack` fixo em 1 (corpo nao empilha). */
+static int corpses_json(char *dst, size_t cap)
+{
+    corpse_forget_expired();
+    size_t o = 0;
+    int n = 0;
+    o += (size_t)snprintf(dst + o, cap - o, "[");
+    for (int i = 0; i < g_corpseCount && o + 128 < cap; i++) {
+        const corpse_t *c = &g_corpses[i];
+        o += (size_t)snprintf(dst + o, cap - o,
+            "%s{\"id\":%u,\"corpseId\":%u,\"stack\":1,\"container\":false,"
+            "\"pos\":{\"x\":%d,\"y\":%d,\"z\":%d}}",
+            n ? "," : "", c->id, c->id, c->x, c->y, (int)c->z);
+        n++;
+    }
+    snprintf(dst + o, cap - o, "]");
+    return n;
+}
 static size_t build_telemetry(uint8_t *out, size_t cap, uint32_t tick)
 {
     entity_t p;
@@ -1973,6 +2141,8 @@ static size_t build_telemetry(uint8_t *out, size_t cap, uint32_t tick)
      * em refresh_creature_stats(). Custo: ~12 B * N criaturas. */
     refresh_creature_stats(0);
     creatures_json(creatures, 16384);
+    char items[8192];
+    corpses_json(items, sizeof items);
 
     /* Aliado invocado (type==3): publica id e nome. `ownSummonId` e
      * `pokemonName` sao campos do contrato de telemetria; sem eles o motor de
@@ -2027,10 +2197,10 @@ static size_t build_telemetry(uint8_t *out, size_t cap, uint32_t tick)
         "\"playerName\":\"%s\",\"activeSlot\":0,\"moves\":[],\"nativeSequence\":[],"
         "%s%s\"pokemonName\":\"%s\",\"comboPokemonName\":\"\","
         "\"conditionEvents\":false,\"conditionsKnown\":false,\"conditions\":[],"
-        "\"roster\":[],\"creatures\":%s,\"items\":[],\"tiles\":[],"
+        "\"roster\":[],\"creatures\":%s,\"items\":%s,\"tiles\":[],"
         "\"clientPid\":%d,\"healthPercent\":%d,\"runtimeReady\":%s}",
         tick, havePlayer ? p.id : 0u, GetTickCount(),
-        px, py, pz, name, ownIdJson, ownPokemonJson, ownName, creatures,
+        px, py, pz, name, ownIdJson, ownPokemonJson, ownName, creatures, items,
         (int)g_targetPid, hp, rtGate ? "true" : "false");
     free(creatures);
     if (n < 0) return 0;
@@ -2219,13 +2389,56 @@ static int tap_key_ex(HWND hwnd, uint16_t vk, uint8_t scan, int extended)
 }
 
 static int tap_key(HWND hwnd, uint16_t vk)
-{
-    uint32_t scan = MapVirtualKeyA(vk, MAPVK_VK_TO_VSC);
+{    uint32_t scan = MapVirtualKeyA(vk, MAPVK_VK_TO_VSC);
     if (!scan || scan > 0xFF) return 0;
     /* Teclas de navegacao exigem o bit extended. */
     int extended = (vk >= VK_PRIOR && vk <= VK_DOWN) || vk == VK_INSERT
                 || vk == VK_DELETE || vk == VK_HOME || vk == VK_END;
     return tap_key_ex(hwnd, vk, (uint8_t)scan, extended);
+}
+
+/* Clique DIREITO no cliente, em coordenadas de cliente (mesmo par de mensagens
+ * que o atuador de teclado usa para atacar). Opcional: a captura depende do
+ * corpo estar sob o cursor antes da tecla da bola. */
+static int click_client(HWND hwnd, int x, int y, int right)
+{
+    if (x < 0 || y < 0 || x > 0xFFFF || y > 0xFFFF) return 0;
+    LPARAM lp = (LPARAM)(uint16_t)x | ((LPARAM)(uint16_t)y << 16);
+    UINT down = right ? WM_RBUTTONDOWN : WM_LBUTTONDOWN;
+    UINT up = right ? WM_RBUTTONUP : WM_LBUTTONUP;
+    WPARAM downW = right ? 2 : 1;
+    if (!PostMessageA(hwnd, down, downW, lp)) return 0;
+    Sleep(15);
+    if (!PostMessageA(hwnd, up, 0, lp)) return 0;
+    return 1;
+}
+
+/* Executa o atalho do slot N da action bar (20 slots, barra central inferior). */
+static int click_action_slot(HWND hwnd, int slot)
+{
+    RECT rc;
+    if (!GetClientRect(hwnd, &rc)) return 0;
+    int w = rc.right - rc.left, h = rc.bottom - rc.top;
+    if (w < 400 || h < 300 || slot < 1 || slot > 20) return 0;
+    double step = 36.0 * ((double)w / 1920.0);
+    if (step < 18.0) step = 18.0;
+    int x = (int)((double)w / 2.0 + ((double)slot - 10.5) * step);
+    int y = h - (int)(48.0 * ((double)h / 1009.0) < 26.0 ? 26.0 : 48.0 * ((double)h / 1009.0));
+    return click_client(hwnd, x, y, 1);
+}
+
+/* Projeta um tile no cliente assumindo camera centrada no jogador. A escala
+ * vem do viewport calibrado de 1920 px (72,36 px por tile). */
+static int project_tile(HWND hwnd, int32_t dx, int32_t dy, int *outX, int *outY)
+{
+    RECT rc;
+    if (!GetClientRect(hwnd, &rc)) return 0;
+    int w = rc.right - rc.left, h = rc.bottom - rc.top;
+    if (w < 200 || h < 200) return 0;
+    double tile = 72.36 * ((double)w / 1920.0);
+    *outX = (int)((double)w / 2.0 + (double)dx * tile);
+    *outY = (int)((double)h * 0.40 + (double)dy * tile);
+    return (*outX > 0 && *outX < w && *outY > 0 && *outY < h);
 }
 
 /* Envia texto para a janela por WM_CHAR.
@@ -3013,7 +3226,7 @@ static int resolve_text_path(HWND *outHwnd)
 
     /* LocalPlayer vivo e com HP > 0 (o consumidor exige [LP+0xb0] > 0) */
     uint64_t lp = 0;
-    if (!mem_read(base + 0x39cb958ULL, &lp, sizeof lp) || !lp) {
+    if (!mem_read(base + 0x39F8E08ULL, &lp, sizeof lp) || !lp) {
         /* o global pode estar NULL em transicao de mapa; nao e' falha fatal,
          * mas o consumidor recusaria — entao recusamos com o motivo certo */
         log_line("texto nativo: LocalPlayer global NULL (transicao de mapa?)");
@@ -3743,16 +3956,32 @@ static uint32_t execute_command(uint32_t id, uint32_t type, const uint8_t *paylo
      *      Nesse caso mapeamos slot -> tecla de funcao, que e' o que o jogador
      *      pode configurar no jogo (F1..F12).
      *
-     * `useWith` (tipo 14) e' tratado separado abaixo: o protocolo o define como
-     * posicao + item, nao tecla. */
-    if (type == 12 || type == 13) {
+     * `useWith` (tipo 14) manda o itemId em +8 (u32) e a tecla da bola como
+     * texto depois de +24; `recallPokemon` (tipo 15) manda a tecla como texto
+     * no formato (a). Ambos caem no mesmo executor de tecla. */
+    if (type == 12 || type == 13 || type == 14 || type == 15) {
         if (len < 12) return STATUS_BAD_COMMAND;
         uint32_t textLen = 0;
         memcpy(&textLen, payload + 8, 4);
         uint16_t vk = 0;
+        int pgx = 0, pgy = 0, stackSlot = 0;
 
         int mods = 0;
-        if (textLen > 0 && textLen <= 24 && 24 + textLen <= len) {
+        if (type == 14) {
+            /* itemId ocupou +8; o texto, se houver, vai de +24 ao fim */
+            size_t tail = len > 24 ? (size_t)(len - 24) : 0;
+            if (tail > 24) {
+                log_line("useWith: tecla longa demais (tail=%zu)", tail);
+                return STATUS_BAD_COMMAND;
+            }
+            if (tail) {
+                const char *keyText = (const char *)payload + 24;
+                if (!parse_key_spec(keyText, (uint32_t)tail, &vk, &mods)) {
+                    log_line("useWith: tecla \"%.*s\" nao reconhecida", (int)tail, keyText);
+                    return STATUS_BAD_COMMAND;
+                }
+            }
+        } else if (textLen > 0 && textLen <= 24 && 24 + textLen <= len) {
             /* formato (a): tecla literal, com modificadores opcionais */
             const char *keyText = (const char *)payload + 24;
             if (!parse_key_spec(keyText, textLen, &vk, &mods)) {
@@ -3783,7 +4012,25 @@ static uint32_t execute_command(uint32_t id, uint32_t type, const uint8_t *paylo
             log_line("item (tipo %u) recusado: PKA_EXECUTOR_MODE=background", type);
             return STATUS_BACKGROUND_UNSUPPORTED;
         }
-        if (!tap_key_with_mods(hwnd, vk, mods)) {
+        if (type == 14 && len >= 20) {
+            /* captura: aponta o corpo antes da tecla. `pos` vem do encoder em
+             * +12; dx/dy sao relativos ao jogador (camera centrada). */
+            uint16_t cx = 0, cy = 0;
+            memcpy(&cx, payload + 12, 2);
+            memcpy(&cy, payload + 14, 2);
+            stackSlot = (int)payload[17];
+            if (g_havePos) {
+                int sx = 0, sy = 0;
+                if (project_tile(hwnd, (int32_t)cx - g_posX, (int32_t)cy - g_posY, &sx, &sy)) {
+                    pgx = sx; pgy = sy;
+                }
+            }
+            log_line("useWith: corpo id=%u em (%u,%u); clique=(%d,%d)%s",
+                     (unsigned)(*((uint32_t *)(payload + 20))), cx, cy, pgx, pgy,
+                     (pgx || pgy) ? "" : " SEM_CLIQUE");
+            Sleep(40);
+        }
+        if (vk && !tap_key_with_mods(hwnd, vk, mods)) {
             log_line("item (tipo %u): PostMessage falhou (vk=%u)", type, vk);
             return STATUS_SEND_FAILED;
         }
@@ -3792,6 +4039,21 @@ static uint32_t execute_command(uint32_t id, uint32_t type, const uint8_t *paylo
         *outKey = vk;
         *haveKey = 1;
         log_line("item (tipo %u): vk=%#x mods=%d enviada", type, vk, mods);
+        /* useWith: seleciona a bola primeiro e depois aponta o corpo. */
+        if (type == 14 && pgx && pgy) {
+            /* PKA_USE_BUTTON=r usa clique direito (o atuador de teclado usa
+             * direito para atacar); padrao esquerdo. */
+            const char *slotEnv = getenv("PKA_BALL_SLOT");
+            int slot = slotEnv ? atoi(slotEnv) : 9;
+            /* `stack` carrega o slot quando o consumidor quiser outro. */
+            /* stack: 1..20 = clicar esse slot da action bar antes; 0 = nao
+             * clicar slot (o consumidor ja' selecionou a bola). */
+            int skipSlot = (payload[17] == 0);
+            if (!skipSlot && stackSlot >= 1 && stackSlot <= 20) slot = stackSlot;
+            Sleep(40);
+            if (!skipSlot && slot >= 1 && slot <= 20) { click_action_slot(hwnd, slot); Sleep(120); }
+            click_client(hwnd, pgx, pgy, 1);
+        }
         return STATUS_OK;
     }
     return STATUS_UNSUPPORTED;
@@ -3848,7 +4110,7 @@ static void boot_id_init(void)
 #define CAP_CONTRACT "pka-capabilities"
 #define CAP_VERSION 1
 #define CAP_COMMANDS "\"walk\",\"attack\",\"stop\",\"talk\",\"combo\"," \
-                     "\"switchPokemon\",\"potion\",\"hotkey\""
+                     "\"switchPokemon\",\"potion\",\"hotkey\",\"useWith\",\"recallPokemon\""
 
 /* kind 6 (s2c): subconjunto honesto do payload do fornecedor. So' os campos
  * que este runtime realmente conhece; nada de `phase`/`luring` inventados. */

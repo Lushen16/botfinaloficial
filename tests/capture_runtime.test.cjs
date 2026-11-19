@@ -12,9 +12,7 @@ const capabilities = require('../reconstruction/capabilities.cjs');
  * IMPORTANTE: a `pka_native.dll` NAO implementa `useWith` (tipo 14 cai em
  * STATUS_UNSUPPORTED). Estes testes exercitam o PIPELINE de captura, nao a
  * DLL; declarar a capacidade aqui e' uma escolha do fixture, documentada, e
- * nao uma excecao implicita do fluxo de producao. O teste
- * "capture requires useWith, which our server does not implement" (em
- * tests/capabilities.test.cjs) cobre o lado do servidor real. */
+ * nao uma excecao implicita do fluxo de producao. */
 const CAPTURE_FIXTURE_DECLARATION = Object.freeze({
   contract: 'pka-capabilities', version: 1, server: 'capture-pipeline-fixture',
   commands: [...Object.keys(COMMANDS), 'useWith'],
@@ -118,6 +116,31 @@ test('Electron native runtime pipeline dispatches useWith then returns to Walker
   clock += 350;
   assert.equal((await runtime.tick()).status, 'walking');
   assert.equal(commands[1].name, 'walk');
+});
+
+test('capture reports missing useWith without blocking Target', async context => {
+  const value = fixture();
+  const commands = [];
+  const declaration = capabilities.parseDeclaration({
+    ...CAPTURE_FIXTURE_DECLARATION, commands: ['attack', 'stop'],
+  });
+  const runtime = new EngineRuntime({ automatic: false, now: () => 1000,
+    openAdapter: async () => captureAdapter({
+      supportedCommands: declaration.commands,
+      capabilities: () => declaration,
+      getSnapshot: () => ({ pid: 42, online: true, ageMs: 0,
+        telemetry: { ...value.telemetry, nativeVerified: true, pulseVersion: 3, creatures: [] } }),
+      command: async name => { commands.push(name); return true; },
+      pauseWalker: async () => true, close: async () => {},
+    }) });
+  context.after(() => runtime.close());
+  await runtime.setModules('target', true, 42, value.config);
+  assert.deepEqual(runtime.modules, ['target']);
+  await runtime.tick();
+  assert.deepEqual(runtime.state.capture, {
+    status: 'blocked', reason: 'capture-command-unavailable', effectVerified: false,
+  });
+  assert.deepEqual(commands, []);
 });
 
 test('Native useWith rejection faults the runtime and is not retried', async context => {

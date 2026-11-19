@@ -86,9 +86,9 @@ function creatureRow(row) {
 
 function itemRow(row) {
   const message = 'Itens inválidos.';
-  if (!within(row.id, 1, 65535)) fail(message);
+  if (!within(row.id, 1, 0xffffffff)) fail(message);
   if (!within(row.stack, 0, 255)) fail(message);
-  if (typeof row.container !== 'boolean') fail(message);
+  if (row.container !== undefined && typeof row.container !== 'boolean') fail(message);
   coordinate(row.pos, message, false);
   return row;
 }

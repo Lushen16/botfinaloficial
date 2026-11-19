@@ -23,6 +23,7 @@
  */
 
 const { normalizeLuring } = require('./engines/lure-engine.cjs');
+const { itemCommand } = require('./engines/healer-engine.cjs');
 const { COMMANDS } = require('./protocol.cjs');
 
 const CONTRACT = 'pka-capabilities';
@@ -42,6 +43,7 @@ const VERSION = 1;
  * se o nome e' utilizavel e' o encoder (`COMMANDS`), nao esta lista. */
 const NATIVE_COMMANDS = Object.freeze([
   'walk', 'attack', 'stop', 'talk', 'combo', 'switchPokemon', 'potion', 'hotkey',
+  'useWith', 'recallPokemon',
 ]);
 
 /* Vocabulario do ENCODER. Um nome fora daqui nao pode nem ser serializado por
@@ -170,15 +172,6 @@ function _mode(config) {
   return normalizeLuring(config).mode;
 }
 
-/** Canal de item do Healer: NAO ha fallback hotkey->action.
- *  `healer-engine.cjs:24-37` usa a hotkey quando existir e so' cai em
- *  `action` quando a hotkey esta' vazia. Se as duas faltam, nao emite nada. */
-function itemChannel(hotkey, actionBar) {
-  if (typeof hotkey === 'string' && hotkey.trim()) return 'hotkey';
-  if (Number.isInteger(actionBar) && actionBar >= 1 && actionBar <= 50) return 'action';
-  return null;
-}
-
 function comboRequirement(combo) {
   if (combo?.enabled !== true) return null;
   const native = combo.useNativeSequence === true;
@@ -203,12 +196,23 @@ function requirementsFor(modules = [], config = {}) {
   const combo = target.combo || {};
   const hoenn = config?.hoenn || {};
   const healer = config?.healer || {};
-  const looting = config?.looting || {};
   const push = (module, feature, commands, mode = 'all') => {
     const list = [...new Set(commands.filter(Boolean))];
     if (!list.length) return;
     requirements.push({ module, feature, commands: list, mode });
   };
+
+  if (active.size) {
+    /* Consumíveis das Tools rodam junto de qualquer modulo. Slot ligado sem
+     * hotkey e' ignorado em silencio pelo motor; exigir cedo evita "liguei e
+     * nao usou". */
+    const toolsConfig = config?.tools || {};
+    for (let slot = 1; slot <= 4; slot += 1) {
+      if (toolsConfig['consumable' + slot]?.enabled === true) {
+        push('tools', 'consumable' + slot, ['hotkey']);
+      }
+    }
+  }
 
   if (active.has('target')) {
     /* Ataque + interrupcao. `attack` sai sempre (target-engine.cjs:407). */
@@ -226,6 +230,10 @@ function requirementsFor(modules = [], config = {}) {
     const comboCmd = comboRequirement(combo);
     if (comboCmd === 'combo') push('target', 'combo', ['combo']);
     if (comboCmd === 'hotkey') push('target', 'combo-hotkey', ['hotkey']);
+    if (combo.enabled === true && (combo.useMedicine === true || combo.useMedicineBeforeCombo === true)
+        && typeof combo.medicineHotkey === 'string' && combo.medicineHotkey.trim()) {
+      push('target', 'combo-medicine', ['hotkey']);
+    }
 
     /* Rotacao de skills avulsas (target-engine.cjs:411-414). */
     if (Array.isArray(target.skills) && target.skills.length) push('target', 'skills', ['hotkey']);
@@ -250,13 +258,15 @@ function requirementsFor(modules = [], config = {}) {
   if (active.has('healer')) {
     /* Potion (healer-engine.cjs:52-56) so' quando o limiar esta' ligado. */
     if (Number(hoenn.potionHpPercent) > 0) {
-      const channel = itemChannel(hoenn.potionHotkey, hoenn.potionActionBar);
-      if (channel) push('healer', 'potion', [channel]);
+      const command = itemCommand('potion', hoenn.potionHotkey, hoenn.potionActionBar);
+      if (command) push('healer', 'potion', [command.name]);
     }
-    /* Medicine (:60-63) exige a flag E o canal. */
+    /* Medicine (:60-63) exige a flag E o canal. Medicine NAO tem fallback
+     * numerico: so' sai por hotkey (diferente de potion). Sem hotkey o motor
+     * trava em `medicine-channel-missing` a cada tick com debuff; exigir aqui
+     * faz o start falhar com mensagem em vez de iniciar e nao curar. */
     if (hoenn.useMedicine === true) {
-      const channel = itemChannel(hoenn.medicineHotkey, hoenn.medicineActionBar);
-      if (channel) push('healer', 'medicine', [channel]);
+      push('healer', 'medicine', ['hotkey']);
     }
     /* Cura do Pokemon (:114-120) e' `talk mX`; o reset tambem (:126-127). */
     if (Number(healer.healHpPercent) > 0 && Number.isInteger(healer.healMoveSlot)
@@ -268,10 +278,6 @@ function requirementsFor(modules = [], config = {}) {
       push('healer', 'healer-return', ['switchPokemon']);
     }
   }
-
-  /* Captura roda no runtime (engine-runtime.cjs beforeActions) e emite
-   * `useWith` — que este servidor NAO implementa (tipo 14 sem handler). */
-  if (looting.captureEnabled === true) push('target', 'capture', ['useWith']);
 
   const commands = [...new Set(requirements.flatMap(entry => entry.commands))];
   return { requirements, commands };

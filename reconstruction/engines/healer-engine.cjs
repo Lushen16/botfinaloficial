@@ -6,6 +6,15 @@ const MEDICINE_RETRY_MS = 1500;
 const HEAL_RETRY_MS = 1000;
 const POTION_RETRY_MS = 1500;
 
+function itemCommand(item, hotkey, slot, keyboardOnly = false) {
+  const key = typeof hotkey === 'string' ? hotkey.trim() : '';
+  if (key) return { name: 'hotkey', parameter: key };
+  if (!keyboardOnly && item === 'potion' && Number.isInteger(slot) && slot >= 1 && slot <= 50) {
+    return { name: 'potion', parameter: slot };
+  }
+  return null;
+}
+
 function rosterMatches(telemetry, name) {
   const wanted = normalizeName(name);
   if (!wanted) return null;
@@ -22,18 +31,22 @@ function createHealerEngine(config, options = {}) {
   const canSend = (name, parameter) => !options.canSend || options.canSend(name, parameter);
 
   function hotkeyChannel(prefix, hotkey, actionBar) {
-    if (typeof hotkey === 'string' && hotkey.trim()) {
-      const text = hotkey.trim();
+    const command = itemCommand(prefix, hotkey, actionBar, options.keyboardOnly);
+    if (!command) {
+      state.blocked.add(prefix + '-channel-missing');
+      return null;
+    }
+    if (command.name === 'hotkey') {
+      const text = command.parameter;
       if (options.keyboardOnly && !/^(?:f(?:[1-9]|1[0-2])|[a-z0-9])$/iu.test(text)) {
         state.blocked.add(prefix + '-keyboard-channel-unsupported'); return null;
       }
-      if (Buffer.byteLength(text, 'utf8') <= 255) return canSend('hotkey', text) ? { name: 'hotkey', parameter: text } : null;
-      state.blocked.add(prefix + '-hotkey-too-long');
-      return null;
+      if (Buffer.byteLength(text, 'utf8') > 255) {
+        state.blocked.add(prefix + '-hotkey-too-long');
+        return null;
+      }
     }
-    if (!options.keyboardOnly && Number.isInteger(actionBar) && actionBar >= 1 && actionBar <= 50) return { name: 'action', parameter: actionBar };
-    state.blocked.add(prefix + '-channel-missing');
-    return null;
+    return canSend(command.name, command.parameter) ? command : null;
   }
 
   function step(telemetry, sink, now) {
@@ -42,14 +55,12 @@ function createHealerEngine(config, options = {}) {
       sink.command(name, parameter, extra); emitted.push([name, parameter]); state.pendingCooldown = cooldown;
     };
     const done = action => ({ action, emitted, waiting: Boolean(state.switchingTo) || telemetry.isSwitching === true || telemetry.switchPending === true, blocked: [...state.blocked] });
-    const playerHealth = telemetry.healthPercent;
-    const hasPlayerHealth = Number.isFinite(playerHealth) && playerHealth >= 0 && playerHealth <= 100;
-    const hPlayer = hasPlayerHealth ? playerHealth : Infinity;
-    const hPet = Number.isFinite(telemetry?.ownPokemon?.healthPercent) ? telemetry.ownPokemon.healthPercent : Infinity;
-    const health = Math.min(hPlayer, hPet);
+    const health = telemetry.healthPercent;
     const hasHealth = Number.isFinite(health) && health >= 0 && health <= 100;
+    const pokemonHealth = telemetry.ownPokemon?.healthPercent;
 
-    if (hasPlayerHealth && Number(hoenn.potionHpPercent) > 0 && playerHealth <= Number(hoenn.potionHpPercent)
+    if (Number.isFinite(pokemonHealth) && pokemonHealth > 0 && pokemonHealth <= 100
+        && Number(hoenn.potionHpPercent) > 0 && pokemonHealth <= Number(hoenn.potionHpPercent)
         && state.potionAt.ready(now, Math.max(0, Number(hoenn.potionCooldownMs) || POTION_RETRY_MS))) {
       const channel = hotkeyChannel('potion', hoenn.potionHotkey, hoenn.potionActionBar);
       if (channel) { send(channel.name, channel.parameter, undefined, state.potionAt); state.potionAt.use(now); return done('heal'); }
@@ -163,4 +174,4 @@ function createHealerEngine(config, options = {}) {
   };
 }
 
-module.exports = { createHealerEngine, rosterMatches, MEDICINE_RETRY_MS, HEAL_RETRY_MS, POTION_RETRY_MS };
+module.exports = { createHealerEngine, itemCommand, rosterMatches, MEDICINE_RETRY_MS, HEAL_RETRY_MS, POTION_RETRY_MS };

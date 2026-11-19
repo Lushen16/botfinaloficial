@@ -1,12 +1,15 @@
 'use strict';
 
-const { ready, runtimeMismatch, isPosition, distance, normalizeName, ignoredNames, isIgnored, activePokemon } = require('./engines/shared.cjs');
+const { ready, realPosition, runtimeMismatch, isPosition, distance, normalizeName, ignoredNames, isIgnored, activePokemon } = require('./engines/shared.cjs');
 const { createWalkerEngine } = require('./engines/walker-engine.cjs');
-const { createTargetEngine } = require('./engines/target-engine.cjs');
+const { createTargetEngine, nativeComboWaitMs } = require('./engines/target-engine.cjs');
 const { createHealerEngine } = require('./engines/healer-engine.cjs');
 const { createLureEngine, normalizeLuring } = require('./engines/lure-engine.cjs');
+const { createConsumablesEngine } = require('./engines/consumables-engine.cjs');
 const { encodeCommand } = require('./protocol.cjs');
 const { mergeCreatureSnapshot } = require('../tools/creature_bridge.cjs');
+
+/* Tentativas de revive por combo (1 envio + 1 retry). */
 
 function gateReason(snapshot) {
   const session = snapshot || {};
@@ -20,7 +23,10 @@ function gateReason(snapshot) {
   if (!telemetry) return 'no-telemetry';
   if (telemetry.nativeVerified !== true) return 'native-unverified';
   if (telemetry.pulseVersion !== 3) return 'pulse-version';
-  if (!telemetry.position) return 'no-position';
+  /* Sentinela nao e' coordenada: (0,0,0) no menu/leitura falha e
+   * (65535,65535,255) em transicao. Reaproveita o motivo `no-position`, que o
+   * spec ja declara. */
+  if (!realPosition(telemetry.position)) return 'no-position';
   if (runtimeMismatch(session)) return 'runtime-pid';
   /* Gate do runtime (adendo 6): `false` = personagem no menu, sem mapa ativo.
    * `Game::walk` executa e nao move ninguem; ataque recusa com gate[+0x2668]=0.
@@ -71,14 +77,15 @@ function createAutomation(config, options = {}) {
     hoenn: { ...config.hoenn, perfectLure: false, minWildsToEngage: 0 },
   } : config;
   const clock = typeof options.now === 'function' ? options.now : () => Date.now();
-  const walker = createWalkerEngine(config);
+  const walker = createWalkerEngine(config, { stepPlanner: options.stepPlanner });
   const target = createTargetEngine(engineSettings);
   const healer = createHealerEngine(hunt ? { ...config,
     hoenn: { ...config.hoenn, potionHpPercent: Number(config.hoenn?.potionHpPercent) > 0 ? resumeAbove : 0 },
     healer: { ...config.healer, healHpPercent: Number(config.healer?.healHpPercent) > 0 ? resumeAbove : 0 },
   } : config, { switchBeforeHeal: Boolean(hunt) });
   const lure = createLureEngine(config, options);
-  const state = { ticks: 0, last: null, lastHotkeyAt: null, recovering: false, revive: null };
+  const consumables = createConsumablesEngine(config);
+  const state = { ticks: 0, last: null, lastHotkeyAt: null, recovering: false, revive: null, reviveHandledAt: null };
 
   /* ─── CONTEXTO DE LURE PARA O TARGET ───
    *
@@ -122,30 +129,80 @@ function createAutomation(config, options = {}) {
       return null;
     }
     const rotation = target.state;
-    if (!state.revive && rotation.comboCompletedAt !== null) {
-      state.revive = { pokemonName: rotation.comboPokemonName, lastSkillAt: rotation.comboCompletedAt, sentAt: null };
+    const completedAt = rotation.comboCompletedAt;
+    /* Um revive por combo. `reviveHandledAt` guarda o combo ja' tratado; sem
+     * isso o estado era limpo logo apos o envio, `comboCompletedAt` continuava
+     * valendo e o revive rearmava a cada tick (spam de F). */
+    if (!state.revive && completedAt !== null && completedAt !== state.reviveHandledAt) {
+      const configured = Number.isFinite(revive.interval) && revive.interval >= 0 ? revive.interval : 1500;
+      const combo = config.target?.combo;
+      const native = combo?.useNativeSequence === true;
+      /* No combo nativo o jogo executa a sequencia: `comboCompletedAt` e'
+       * marcado no ENVIO do hotkey, nao no fim. Esperar so' o intervalo (200 ms
+       * numa auditoria) mandava o Revive no meio do combo. `comboFallbackMs`
+       * e' o piso medido para "combo sem resposta" no Shiba. */
+      const interval = native
+        ? Math.max(configured, nativeComboWaitMs(combo, config.hoenn))
+        : configured;
+      state.revive = { pokemonName: rotation.comboPokemonName, sentAt: null, sentTick: null,
+        interval, completedAt, nextSendAt: now + interval };
     }
     if (!state.revive) return null;
     const pending = state.revive;
-    if (pending.sentAt === null && rotation.comboCompletedAt !== null) pending.lastSkillAt = rotation.comboCompletedAt;
     const emitted = [];
-    let reason = 'await-revive-interval';
+
+    const finish = () => {
+      state.revive = null;
+      state.reviveHandledAt = completedAt;
+      target.finishCombo(telemetry);
+    };
+
     if (pending.sentAt === null) {
-      const interval = Number.isFinite(revive.interval) && revive.interval >= 0 ? revive.interval : 1500;
+      /* O ultimo skill pode ser despachado DEPOIS do armamento; nesse caso o
+       * prazo conta do novo despacho. */
+      if (completedAt !== null && completedAt !== pending.completedAt) {
+        pending.completedAt = completedAt;
+        pending.nextSendAt = completedAt + pending.interval;
+      }
       const hotkeysBlocked = (state.lastHotkeyAt !== null && now - state.lastHotkeyAt < 250)
         || options.hotkeysBlocked?.() === true;
-      if (now - pending.lastSkillAt >= interval && !hotkeysBlocked) {
-        output.command('hotkey', revive.hotkey.trim());
-        emitted.push(['hotkey', revive.hotkey.trim()]);
-        pending.sentAt = now;
-        reason = 'revive-sent';
+      if (now < pending.nextSendAt || hotkeysBlocked) {
+        return { status: 'revive', pauseWalker: true, emitted, reason: 'await-revive-interval' };
       }
-    } else if (revive.waitForPokemon !== true || activePokemon(telemetry, pending.pokemonName)) {
-      state.revive = null;
-      target.restartCombo();
+      output.command('hotkey', revive.hotkey.trim());
+      emitted.push(['hotkey', revive.hotkey.trim()]);
+      pending.sentAt = now;
+      pending.sentTick = telemetry.tick;
+      return { status: 'revive', pauseWalker: true, emitted, reason: 'revive-sent' };
+    }
+
+    const configuredTimeout = config.hoenn?.pokeReadyTimeoutMs;
+    const timeout = Number.isFinite(configuredTimeout) && configuredTimeout > 0 ? configuredTimeout : 3000;
+    const active = activePokemon(telemetry, pending.pokemonName);
+    const own = telemetry.ownPokemon;
+    const hp = own?.healthPercent ?? active?.healthPercent ?? telemetry.healthPercent;
+    const observed = !Number.isInteger(pending.sentTick) || telemetry.tick > pending.sentTick;
+    const ownMatches = !own?.name || normalizeName(own.name) === normalizeName(pending.pokemonName);
+    const confirmed = observed && Boolean(active) && ownMatches && Number.isFinite(hp) && hp > 0 && hp <= 100;
+
+
+    /* Sem waitForPokemon o Shiba segue logo apos o clique: basta um tick. */
+    if (revive.waitForPokemon !== true) {
+      finish();
       return null;
-    } else reason = 'await-active-pokemon';
-    return { status: 'revive', pauseWalker: true, emitted, reason };
+    }
+    if (confirmed) {
+      finish();
+      return null;
+    }
+
+    /* Sem confirmacao: espera o timeout. Nao reenvia antes dele — era assim
+     * que o revive virava rajada. */
+    if (now - pending.sentAt < timeout) {
+      return { status: 'revive', pauseWalker: true, emitted, reason: 'await-active-pokemon' };
+    }
+    finish();
+    return { status: 'revive', pauseWalker: true, emitted, reason: 'revive-timeout', effectVerified: false };
   }
 
   function huntStep(telemetry, output, now, hotkeysBlocked, beforeActions) {
@@ -173,6 +230,11 @@ function createAutomation(config, options = {}) {
       const fight = target.step(telemetry, output, now, { hotkeysBlocked });
       const revive = reviveStep(telemetry, output, now);
       if (revive) return { ...revive, detected, fight, emitted: [...fight.emitted, ...revive.emitted] };
+      if (fight.reason === 'combo-done') target.finishCombo(telemetry);
+      if (fight.reason === 'finish-remaining') {
+        const walk = walker.step(telemetry, output, now);
+        return { status: 'walking', pauseWalker: false, detected, walk, emitted: walk.emitted, reason: fight.reason };
+      }
       return { status: 'combat', pauseWalker: true, detected, fight, emitted: fight.emitted, reason: fight.reason || null };
     }
     target.clearTarget();
@@ -221,6 +283,13 @@ function createAutomation(config, options = {}) {
       return result;
     } };
     state.ticks += 1;
+    /* Consumíveis antes de cura/combate: são agendados por tempo e um hotkey
+     * por tick. Se um venceu, ele ocupa o tick. */
+    const consumable = consumables.step(now, output);
+    if (consumable.emitted.length) {
+      state.last = { status: 'consumable', reason: null, emitted: consumable.emitted, blocked: [] };
+      return state.last;
+    }
     if (hunt) {
       state.last = huntStep(telemetry, output, now, hotkeysBlocked, beforeActions);
       return state.last;
@@ -246,6 +315,7 @@ function createAutomation(config, options = {}) {
       state.last = { ...revive, fight, emitted: [...fight.emitted, ...revive.emitted] };
       return state.last;
     }
+    if (fight.reason === 'combo-done') target.finishCombo(telemetry);
     let walk = { action: 'skipped', emitted: [] };
     let lureResult = { allowMovement: true, state: 'off', emitted: [] };
     if (fight.action === 'idle' || fight.action === 'luring') {
@@ -270,6 +340,7 @@ function createAutomation(config, options = {}) {
 
   return {
     tick,
+    recordAttackDelivery: target.recordAttackDelivery,
     recordDispatch(name, parameter, timestamp) {
       if (name === 'hotkey') {
         state.lastHotkeyAt = timestamp;
@@ -280,10 +351,10 @@ function createAutomation(config, options = {}) {
       target.recordDispatch(name, parameter, timestamp);
     },
     reset() {
-      walker.reset(); target.reset(); healer.reset(); lure.reset();
-      state.ticks = 0; state.last = null; state.lastHotkeyAt = null; state.recovering = false; state.revive = null;
+      walker.reset(); target.reset(); healer.reset(); lure.reset(); consumables.reset();
+      state.ticks = 0; state.last = null; state.lastHotkeyAt = null; state.recovering = false; state.revive = null; state.reviveHandledAt = null;
     },
-    get state() { return { ticks: state.ticks, walker: walker.state, target: target.state, healer: healer.state, lure: lure.state }; },
+    get state() { return { ticks: state.ticks, walker: walker.state, target: target.state, healer: healer.state, lure: lure.state, consumables: consumables.state, revive: state.revive }; },
     get last() { return state.last; },
   };
 }

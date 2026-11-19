@@ -31,16 +31,16 @@ MEM_COMMIT = 0x1000
 PAGE_GUARD = 0x100
 READABLE = (0x02, 0x04, 0x20, 0x40, 0x80)  # READONLY/WRITECOPY/EXECUTE_READ/...
 
-OFF_POS = 0x30
-OFF_Z = 0x38
-OFF_ID = 0x5C
-OFF_NAME = 0x80
-OFF_HP = 0xC0
-OFF_TYPE = 0x186
+OFF_POS = 0x20
+OFF_Z = 0x28
+OFF_ID = 0x4C
+OFF_NAME = 0x70
+OFF_HP = 0xB0
+OFF_TYPE = 0x176
 ENTITY_SIZE = 0x190
 
 # RVAs conhecidas da vtable de LocalPlayer. Sao ATALHO: validadas antes do uso.
-PLAYER_VTABLE_RVAS = (0x1FAC310, 0x1F3F1F0)
+PLAYER_VTABLE_RVAS = (0x1FB5660, 0x1FAC310, 0x1F3F1F0)
 
 k32 = ctypes.WinDLL('kernel32', use_last_error=True)
 k32.OpenProcess.restype = wintypes.HANDLE
@@ -255,8 +255,14 @@ def game_module(pid):
 
 
 def resolve_vtable(reader, base, image_size):
-    """Valida cada RVA candidata: o primeiro slot precisa apontar para dentro da imagem."""
+    """RVAs candidatas cujo primeiro slot aponta para dentro da imagem.
+
+    O teste e' fraco e mais de uma RVA passa (0x1FAC310 e' o atalho de um build
+    antigo e passava). Por isso devolve TODAS, na ordem fixa, e quem chama tenta
+    cada uma ate' achar entidade valida.
+    """
     tried = []
+    good = []
     for rva in PLAYER_VTABLE_RVAS:
         va = base + rva
         raw = reader.read(va, 8)
@@ -267,8 +273,22 @@ def resolve_vtable(reader, base, image_size):
         inside = base <= first < base + image_size
         tried.append({'rva': hex(rva), 'firstSlot': hex(first), 'insideImage': inside})
         if inside:
-            return {'ok': True, 'vtable': va, 'rva': hex(rva), 'tried': tried}
-    return fail('nenhuma vtable candidata valida', tried=tried)
+            good.append(va)
+    if not good:
+        return fail('nenhuma vtable candidata valida', tried=tried)
+    return {'ok': True, 'vtables': good, 'tried': tried}
+
+
+def read_name(rd, raw, off):
+    """Nome da entidade: ponteiro quando cap >= 16 (size pode ser 0)."""
+    if off + 0x18 > len(raw):
+        return ''
+    ptr, size, cap = struct.unpack('<QQQ', raw[off:off + 0x18])
+    if 16 <= cap <= 4096:
+        want = size if 0 < size <= 32 else min(cap, 32)
+        data = rd.read(ptr, want) or b''
+        return data.split(b'\x00')[0].decode('latin1', 'replace')
+    return raw[off:off + 32].split(b'\x00')[0].decode('latin1', 'replace')
 
 
 def entity(pid, wanted, reader=None, base_info=None):
@@ -288,58 +308,64 @@ def entity(pid, wanted, reader=None, base_info=None):
         vt = resolve_vtable(rd, base, size)
         if not vt['ok']:
             return vt
-        pattern = struct.pack('<Q', vt['vtable'])
-        candidates = []
-        for rbase, rsize in rd.regions():
-            off = 0
-            while off < rsize:
-                chunk = min(0x100000, rsize - off)
-                data = rd.read(rbase + off, chunk)
-                if data:
-                    pos = 0
-                    while True:
-                        idx = data.find(pattern, pos)
-                        if idx < 0:
-                            break
-                        candidates.append(rbase + off + idx)
-                        pos = idx + 1
-                off += chunk
         valid = []
         rejected = []
-        for va in candidates:
-            raw = rd.read(va, ENTITY_SIZE)
-            if len(raw) < ENTITY_SIZE:
-                rejected.append({'va': hex(va), 'why': 'curto'})
-                continue
-            x, y = struct.unpack('<ii', raw[OFF_POS:OFF_POS + 8])
-            z = struct.unpack('<h', raw[OFF_Z:OFF_Z + 2])[0]
-            eid = struct.unpack('<I', raw[OFF_ID:OFF_ID + 4])[0]
-            name = raw[OFF_NAME:OFF_NAME + 32].split(b'\x00')[0].decode('latin1', 'replace')
-            hp = raw[OFF_HP]
-            etype = raw[OFF_TYPE]
-            reasons = []
-            if not name:
-                reasons.append('sem nome')
-            elif name.lower() != wanted.lower():
-                reasons.append('nome=' + name)
-            if etype != 0:
-                reasons.append('type=' + str(etype))
-            if eid == 0:
-                reasons.append('id=0')
-            if not (0 <= x <= 65534 and 0 <= y <= 65534):
-                reasons.append('xy fora do mapa')
-            if not (0 <= z <= 15):
-                reasons.append('z=' + str(z))
-            if not (0 <= hp <= 100):
-                reasons.append('hp=' + str(hp))
-            if reasons:
-                rejected.append({'va': hex(va), 'why': ','.join(reasons)})
-                continue
-            valid.append({'va': hex(va), 'id': eid, 'name': name,
-                          'pos': {'x': x, 'y': y, 'z': z}, 'hp': hp, 'type': etype})
+        candidates = []
+        used_vtable = None
+        for vtable in vt['vtables']:
+            pattern = struct.pack('<Q', vtable)
+            candidates = []
+            for rbase, rsize in rd.regions():
+                off = 0
+                while off < rsize:
+                    chunk = min(0x100000, rsize - off)
+                    data = rd.read(rbase + off, chunk)
+                    if data:
+                        pos = 0
+                        while True:
+                            idx = data.find(pattern, pos)
+                            if idx < 0:
+                                break
+                            candidates.append(rbase + off + idx)
+                            pos = idx + 1
+                    off += chunk
+            for va in candidates:
+                raw = rd.read(va, ENTITY_SIZE)
+                if len(raw) < ENTITY_SIZE:
+                    rejected.append({'va': hex(va), 'vtable': hex(vtable), 'why': 'curto'})
+                    continue
+                x, y = struct.unpack('<ii', raw[OFF_POS:OFF_POS + 8])
+                z = struct.unpack('<h', raw[OFF_Z:OFF_Z + 2])[0]
+                eid = struct.unpack('<I', raw[OFF_ID:OFF_ID + 4])[0]
+                name = read_name(rd, raw, OFF_NAME)
+                hp = raw[OFF_HP]
+                etype = raw[OFF_TYPE]
+                reasons = []
+                if not name:
+                    reasons.append('sem nome')
+                elif name.lower() != wanted.lower():
+                    reasons.append('nome=' + name)
+                if etype != 0:
+                    reasons.append('type=' + str(etype))
+                if eid == 0:
+                    reasons.append('id=0')
+                if not (0 <= x <= 65534 and 0 <= y <= 65534):
+                    reasons.append('xy fora do mapa')
+                if not (0 <= z <= 15):
+                    reasons.append('z=' + str(z))
+                if not (0 <= hp <= 100):
+                    reasons.append('hp=' + str(hp))
+                if reasons:
+                    rejected.append({'va': hex(va), 'vtable': hex(vtable), 'why': ','.join(reasons)})
+                    continue
+                valid.append({'va': hex(va), 'id': eid, 'name': name,
+                              'pos': {'x': x, 'y': y, 'z': z}, 'hp': hp, 'type': etype})
+            if valid:
+                used_vtable = vtable
+                break
         if not valid:
             return fail('entidade do jogador nao encontrada',
-                        vtable=hex(vt['vtable']), candidates=len(candidates),
+                        vtable=hex(used_vtable or vt['vtables'][0]), candidates=len(candidates),
                         rejected=rejected[:6])
         positions = {json.dumps(v['pos'], sort_keys=True) for v in valid}
         if len(positions) > 1:
@@ -486,6 +512,7 @@ def cmd_sample(args):
             if not r.h:
                 return fail('OpenProcess', win32=r.error)
             raw = r.read(anchor_va, ENTITY_SIZE)
+            name = read_name(r, raw, OFF_NAME) if len(raw) >= ENTITY_SIZE else ''
         finally:
             r.close()
         if len(raw) < ENTITY_SIZE:
@@ -493,7 +520,6 @@ def cmd_sample(args):
         x, y = struct.unpack('<ii', raw[OFF_POS:OFF_POS + 8])
         z = struct.unpack('<h', raw[OFF_Z:OFF_Z + 2])[0]
         eid = struct.unpack('<I', raw[OFF_ID:OFF_ID + 4])[0]
-        name = raw[OFF_NAME:OFF_NAME + 32].split(b'\x00')[0].decode('latin1', 'replace')
         hp = raw[OFF_HP]
         etype = raw[OFF_TYPE]
         reasons = []
@@ -556,6 +582,7 @@ def cmd_sample(args):
 
     return {
         'ok': all(checks.values()),
+        'stable': all(checks.values()),
         'validReads': len(valid),
         'total': len(samples),
         'coverageMs': coverage_ms,

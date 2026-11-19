@@ -9,21 +9,30 @@ const messages = require('../reconstruction/app/ui/messages.js');
 const { validateConfig } = require('../reconstruction/settings.cjs');
 const { WalkerInputRuntime } = require('../reconstruction/walker-input-runtime.cjs');
 
-test('native AutoCombo UI preserves the original form without an unsupported hotkey', () => {
+test('native AutoCombo UI displays its hotkey only in native mode', () => {
   const published = fs.readFileSync(path.join(__dirname, '../reconstruction/app/ui/target.js'), 'utf8');
-  const original = fs.readFileSync(path.join(__dirname, '../../Extracted_Source/renderer/target.js'), 'utf8');
-  assert.equal(published.trimEnd(), original.trimEnd());
-  assert.doesNotMatch(published, /nativeHotkey|Hotkey AutoCombo|T_nat/u);
+  assert.match(published, /"Hotkey AutoCombo",c,"nativeHotkey"/u);
+  assert.match(published, /ACombo\.hidden="native"!==e/u);
 });
 
-test('native AutoCombo saves and reloads using only fields of the original schema', () => {
+test('native AutoCombo persists a configured hotkey and accepts older profiles', () => {
   const config = schema.createConfig();
   config.target.combo.enabled = true;
   config.target.combo.useNativeSequence = true;
+  config.target.combo.nativeHotkey = 'C';
   const saved = validateConfig(config);
   const reloaded = validateConfig(JSON.parse(JSON.stringify(saved)));
   assert.deepEqual(reloaded.target.combo, config.target.combo);
-  assert.equal(Object.hasOwn(reloaded.target.combo, 'nativeHotkey'), false);
+  delete config.target.combo.nativeHotkey;
+  assert.equal(Object.hasOwn(validateConfig(config).target.combo, 'nativeHotkey'), false);
+});
+
+test('older profiles with combo.n migrate the hotkey to nativeHotkey', () => {
+  const config = schema.createConfig();
+  config.target.combo.n = 'F5';
+  const loaded = validateConfig(config);
+  assert.equal(loaded.target.combo.nativeHotkey, 'F5');
+  assert.equal(Object.hasOwn(loaded.target.combo, 'n'), false);
 });
 
 test('keyboard-only module error remains specific in both banner and Target diagnostics', async () => {

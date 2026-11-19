@@ -52,9 +52,76 @@ const TICK_RESET_MIN = 1000;
 const STEP_INTERVAL_MS = 406;
 const STEP_INTERVAL_MAX_MS = 2000;
 
+/**
+ * Amostras consecutivas SEM melhorar a distancia ao waypoint antes de declarar
+ * a rota travada.
+ *
+ * POR QUE (M01, medido em simulacao): `attempts` zera sempre que o corpo muda
+ * de tile (`state.attempts = stuck ? attempts+1 : 0`). Quando o TILE do
+ * waypoint esta' ocupado por outra criatura mas os vizinhos estao livres, o
+ * contorno `clockwise` faz o corpo ORBITAR: cada passo cai num tile novo, ou
+ * seja, `stuck` nunca fica verdadeiro, `attempts` nunca acumula e `stuck` nunca
+ * dispara. Medido com `box` a 2 tiles e (102,100) bloqueado:
+ *
+ *   300 comandos, 12 tiles unicos distintos, deriva de ate' 3 tiles do waypoint,
+ *   `stuck` NUNCA reportado.
+ *
+ * A guarda correta e' de PROGRESSO, nao de tile repetido: conta amostras
+ * consecutivas que nao aproximam do waypoint.
+ *
+ * O TEMPO ATE' O `stuck` DEPENDE DO PISO DE CADENCIA, porque a guarda e'
+ * avaliada DEPOIS dele (uma amostra que cai em `cadence` nao chega ao contador).
+ * Medido com `box` a 2 tiles e (102,100) bloqueado:
+ *
+ *   stepIntervalMs: 0    -> stuck em 1250 ms (~25 amostras de 50 ms, 13 comandos)
+ *   stepIntervalMs: 406  -> stuck em 5850 ms (13 comandos, ~406 ms por passo)
+ *
+ * O numero util e' o de PASSOS, nao o de milissegundos: 13 comandos em ambos.
+ * A versao anterior deste comentario dizia "12 amostras ~ 600 ms", que era
+ * falso por ~10x no regime padrao (o piso de 406 ms domina o tempo).
+ */
+const ORBIT_SAMPLES = 12;
+
 function clockwise(directionId) {
   return directionId <= 3 ? (directionId + 1) % 4 : 4 + (directionId - 4 + 1) % 4;
 }
+
+/* Direcao de saída de um waypoint `stairs` (`param`). Vazio = só pisar no tile
+ * (buraco, rampa). O `param` do Shiba é a direção para usar a escada; antes ele
+ * era ignorado e o motor só esperava o `z` mudar — escada direcional falhava. */
+const STAIR_DIRECTIONS = Object.freeze({ north: 0, east: 1, south: 2, west: 3 });
+
+function stairDirection(param) {
+  const key = String(param ?? '').trim().toLowerCase();
+  return Object.hasOwn(STAIR_DIRECTIONS, key) ? STAIR_DIRECTIONS[key] : null;
+}
+
+/* Direcao -> delta de tile, no vocabulario do protocolo (mesmo de shared). */
+const STEP_DELTA = Object.freeze({
+  0: [0, -1], 1: [1, 0], 2: [0, 1], 3: [-1, 0],
+  4: [1, -1], 5: [1, 1], 6: [-1, 1], 7: [-1, -1],
+});
+
+/**
+ * O tile do waypoint esta' ocupado por outra criatura viva?
+ *
+ * `box` e `safespot` sao AREA, nao tile exato (ver ARRIVAL_TOLERANCE_ACTIONS).
+ * Um monstro parado no tile exato e' o caso normal numa hunt; sem esta leitura
+ * a unica saida era orbitar ate' o `stuck`.
+ *
+ * A fonte e' a telemetria: qualquer criatura com posicao no tile, viva
+ * (`healthPercent > 0`) e que nao seja o proprio jogador. Corpo morto
+ * (`healthPercent === 0`) nao bloqueia; criatura sem o campo conta como viva.
+ * Sem lista de criaturas a regra nao se aplica e o motor segue exigindo o tile.
+ */
+function tileOccupied(telemetry, pos) {
+  const creatures = Array.isArray(telemetry?.creatures) ? telemetry.creatures : [];
+  return creatures.some(entry => entry && entry.id !== telemetry.playerId
+    && Number(entry.healthPercent) !== 0 && samePlane(entry.pos, pos));
+}
+
+/* Acoes cujo tile e' area: chegada vale no vizinho quando o tile esta' ocupado. */
+const ARRIVAL_TOLERANCE_ACTIONS = Object.freeze(['box', 'safespot']);
 
 function normalizeWaypoint(waypoint) {
   if (!waypoint || typeof waypoint !== 'object') throw new Error('Waypoint invalido.');
@@ -68,8 +135,12 @@ function normalizeWaypoint(waypoint) {
   };
 }
 
-function createWalkerEngine(config) {
+function createWalkerEngine(config, options = {}) {
   const walker = config?.walker || {};
+  /* Planejador opcional (ver reconstruction/pathfinder.cjs). Sem ele, ou sem
+   * resposta, o motor mantem o passo guloso de sempre. */
+  const planner = options && typeof options.stepPlanner?.plan === 'function'
+    ? options.stepPlanner : null;
   const waypoints = (Array.isArray(walker.waypoints) ? walker.waypoints : []).map(normalizeWaypoint);
   const loop = walker.loop !== false;
   const smart = walker.smartWalking === true;
@@ -80,7 +151,10 @@ function createWalkerEngine(config) {
     : STEP_INTERVAL_MS;
   const state = { index: 0, waitingUntil: 0, lastPosition: null, lastMoveTick: null, attempts: 0, stalls: 0,
     pendingStairs: null, saidIndex: -1, finished: false, started: false, approachFrom: null,
-    pendingStep: null, wasSkipped: false, tickSeq: 0, lastDispatchAt: -Infinity };
+    pendingStep: null, wasSkipped: false, tickSeq: 0, lastDispatchAt: -Infinity,
+    /* Guarda de orbita (ver ORBIT_SAMPLES): melhor distancia ja' vista ao
+     * waypoint atual e quantas amostras seguidas nao melhoraram. */
+    bestRemaining: null, orbitSamples: 0, usingPlan: false };
 
   function nearestIndex(position) {
     let best = 0;
@@ -99,6 +173,9 @@ function createWalkerEngine(config) {
     state.stalls = 0;
     state.approachFrom = null;
     state.pendingStep = null;
+    /* Zera a guarda de orbita: o proximo waypoint tem a propria metrica. */
+    state.bestRemaining = null;
+    state.orbitSamples = 0;
     if (state.index + 1 < waypoints.length) { state.index += 1; return true; }
     if (loop && waypoints.length) { state.index = 0; return true; }
     state.finished = true;
@@ -359,8 +436,36 @@ function createWalkerEngine(config) {
     // Only a stairs waypoint verifies z, by waiting for the floor to change
     // from the floor observed when the stair tile was reached.
     if (waypoint.action === 'stairs' && samePlane(position, waypoint.pos)) {
-      state.pendingStairs = { fromZ: position.z, deadline: now + STAIRS_TIMEOUT_MS };
-      return { action: 'hold', emitted: [], reason: 'stairs' };
+      const direction = stairDirection(waypoint.param);
+      state.pendingStairs = {
+        fromZ: position.z,
+        deadline: now + STAIRS_TIMEOUT_MS,
+      };
+      if (direction === null) return { action: 'hold', emitted: [], reason: 'stairs' };
+      /* Passo UNICO para dentro da escada. Sem `pendingStep`: o que confirma a
+       * transicao e' o `z`, nao o tile. O guarda `pendingStairs` impede repetir. */
+      sink.command('walk', direction);
+      state.lastDispatchAt = now;
+      state.lastPosition = position;
+      return { action: 'move', emitted: [['walk', direction]], direction, index: state.index, reason: 'stairs-stepping' };
+    }
+
+    /* --- box/safespot com o tile do waypoint ocupado ---
+     *
+     * Diferente de `walk` (que e' um ponto), `box` e `safespot` sao area: o
+     * Shiba para e combate na regiao. Exigir o tile exato fazia o corpo orbitar
+     * quando um monstro estava em cima do waypoint — situacao normal, nao erro
+     * (ver ORBIT_SAMPLES). Aqui o vizinho livre vale como chegada.
+     *
+     * Fica ANTES do passo pendente: nao ha o que reconciliar, o waypoint ja'
+     * foi cumprido. A condicao exige distancia 1 E o tile ocupado; waypoint
+     * livre continua exigindo o tile exato, e um monstro longe nao antecipa a
+     * chegada. */
+    if (ARRIVAL_TOLERANCE_ACTIONS.includes(waypoint.action)
+        && planeDistance(position, waypoint.pos) === 1
+        && tileOccupied(telemetry, waypoint.pos)) {
+      state.pendingStep = null;
+      return next([], 'arrived-adjacent');
     }
 
     /* --- Chegada ao waypoint TEM PRECEDENCIA sobre o passo pendente ---
@@ -425,25 +530,54 @@ function createWalkerEngine(config) {
         waitMs: stepIntervalMs - (now - state.lastDispatchAt) };
     }
 
+    /* --- Plano de passo ---
+     *
+     * Com planejador, `remaining` e' custo de CAMINHO, nao distancia em linha
+     * reta: contornar parede pode afastar do waypoint e ainda assim progredir.
+     * Sem planejador (ou sem rota), cai no guloso e a metrica volta a ser
+     * euclidiana. */
+    let planned = null;
+    if (planner && waypoint.action !== 'stairs') {
+      try { planned = planner.plan(position, waypoint.pos); } catch { planned = null; }
+      if (planned && !Number.isInteger(planned.direction)) planned = null;
+    }
+    const remaining = planned ? planned.remaining : planeDistance(position, waypoint.pos);
+    if (Boolean(planned) !== state.usingPlan || state.bestRemaining === null || remaining < state.bestRemaining) {
+      state.usingPlan = Boolean(planned);
+      state.bestRemaining = remaining;
+      state.orbitSamples = 0;
+    } else {
+      state.orbitSamples += 1;
+      if (state.orbitSamples >= ORBIT_SAMPLES) return next([], 'stuck');
+    }
+
     const stuck = sameTile(position, state.lastPosition);
     state.attempts = stuck ? state.attempts + 1 : 0;
-    let move = direction(position, target);
+    let move = planned ? planned.direction : direction(position, target);
     if (state.attempts >= STUCK_LIMIT) {
-      move = clockwise(move);
+      /* Sem plano, `clockwise` e' o unico contorno. Com plano, tenta manter a
+       * rota e so' desvia se ela insistir em bater. */
+      if (!planned) move = clockwise(move);
       if (state.attempts >= STALL_LIMIT) return next([], 'stuck');
     }
+    if (!planned && waypoint.action !== 'stairs' && position.z === waypoint.pos.z
+        && planner?.canStep?.(position, move) === false) {
+      state.lastPosition = position;
+      state.lastDispatchAt = now;
+      return { action: 'hold', emitted: [], reason: 'map-blocked', index: state.index };
+    }
+    const stepTarget = {
+      x: position.x + STEP_DELTA[move][0],
+      y: position.y + STEP_DELTA[move][1],
+      z: position.z,
+    };
     sink.command('walk', move);
     state.lastDispatchAt = now;
 
-    /* Registra o passo pendente. `target` e' o TILE DESTE PASSO (1 tile),
+    /* Registra o passo pendente. `stepTarget` e' o TILE DESTE PASSO (1 tile),
      * nao o waypoint final — e' o que permite confirmar passo a passo sem
-     * pular waypoints. */
-    const stepTarget = {
-      x: position.x + Math.sign(target.x - position.x),
-      y: position.y + Math.sign(target.y - position.y),
-      z: position.z,
-    };
-
+     * pular waypoints. Vem do delta da DIRECAO, nao do sinal do waypoint: com
+     * planejador um passo pode andar contra o waypoint para contornar parede. */
     state.pendingStep = {
       direction: move,
       from: { ...position },
@@ -472,8 +606,14 @@ function createWalkerEngine(config) {
   return {
     step,
     notifySkipped,
+    /* `reset()` reinicia a INSTANCIA (troca de rota, reativacao do modulo).
+     * Precisa zerar a guarda de orbita junto: se `bestRemaining` sobrevivesse,
+     * a proxima rota herdaria a melhor distancia da ANTERIOR e dispararia
+     * `stuck` cedo; se `orbitSamples` sobrevivesse, o contador comecaria
+     * poluido e a rota morreria antes de tentar. */
     reset() { Object.assign(state, { index: 0, waitingUntil: 0, lastPosition: null, lastMoveTick: null, attempts: 0, stalls: 0,
-      pendingStairs: null, saidIndex: -1, finished: false, started: false, approachFrom: null, pendingStep: null, wasSkipped: false, tickSeq: 0, lastDispatchAt: -Infinity }); },
+      pendingStairs: null, saidIndex: -1, finished: false, started: false, approachFrom: null, pendingStep: null, wasSkipped: false, tickSeq: 0, lastDispatchAt: -Infinity,
+      bestRemaining: null, orbitSamples: 0, usingPlan: false }); },
     get state() { return { index: state.index, pendingStairs: state.pendingStairs, finished: state.finished, total: waypoints.length,
       pendingStep: state.pendingStep ? { ...state.pendingStep } : null }; },
     waypoints: () => waypoints.map(waypoint => ({ ...waypoint, pos: { ...waypoint.pos } })),
@@ -481,4 +621,4 @@ function createWalkerEngine(config) {
   };
 }
 
-module.exports = { createWalkerEngine, normalizeWaypoint, ACTIONS, STAIRS_TIMEOUT_MS, STUCK_LIMIT, PROGRESS_TIMEOUT_MS, TICK_RESET_MIN, STEP_INTERVAL_MS };
+module.exports = { createWalkerEngine, normalizeWaypoint, ACTIONS, STAIRS_TIMEOUT_MS, STUCK_LIMIT, PROGRESS_TIMEOUT_MS, TICK_RESET_MIN, STEP_INTERVAL_MS, ORBIT_SAMPLES };

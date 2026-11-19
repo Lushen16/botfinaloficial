@@ -34,6 +34,11 @@ for (const entry of entries) {
     Buffer.from('\n'), walkerInputUi]);
   if (target === 'walker.js') generated = Buffer.from(entry.bytes.toString('utf8')
     .replace('if(6&a)throw Error', 'if(!window.PkaWalker.canStand(a))throw Error'));
+  if (target === 'schema.js') generated = Buffer.from(entry.bytes.toString('utf8')
+    .replace('r("useNativeSequence","Sequência nativa"),', '$&o("nativeHotkey","Hotkey AutoCombo"),'));
+  if (target === 'target.js') generated = Buffer.from(entry.bytes.toString('utf8')
+    .replace('const T=k(R);function H()', 'const ACombo=k(R), comboKey=h(ACombo,"Hotkey AutoCombo",c,"nativeHotkey","text",0,0,"Tecla configurada no AutoCombo do cliente.");comboKey.value=c.nativeHotkey??"";comboKey.placeholder="Ex.: C";const T=k(R);function H()')
+    .replace('T.hidden="manual"!==e,', 'ACombo.hidden="native"!==e,T.hidden="manual"!==e,'));
   const asset = planAsset(entry.bytes, generated, fs.existsSync(output) ? fs.readFileSync(output) : null,
     previousHashes.get(target));
   if (!asset.preserved) fs.writeFileSync(output, asset.bytes);

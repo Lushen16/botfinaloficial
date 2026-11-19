@@ -169,7 +169,7 @@ test('RPM combat readiness surfaces scanner identity errors even without a Walke
   assert.ok(!issues.some(issue => issue.message.includes('Backend teclado/RPM ativo')));
 });
 
-test('RPM combat readiness skips Medicine, PokeStop and Revive requirements the runtime does not execute', () => {
+test('RPM combat readiness asks for Medicine and Revive hotkeys', () => {
   const context = diagnostics();
   const config = context.PkaSchema.createConfig();
   config.target.monsters = [];
@@ -182,7 +182,7 @@ test('RPM combat readiness skips Medicine, PokeStop and Revive requirements the 
   assert.ok(rpmIssues.some(issue => issue.path === 'target.monsters'));
   const nativeIssues = context.PkaDiagnostics.targetStartIssues(config, { ...base, source: 'native' });
   for (const issuePath of ['target.combo.medicineHotkey', 'target.autoRevive.hotkey']) {
-    assert.equal(rpmIssues.some(issue => issue.path === issuePath), false);
+    assert.ok(rpmIssues.some(issue => issue.path === issuePath));
     assert.ok(nativeIssues.some(issue => issue.path === issuePath));
   }
 });

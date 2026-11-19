@@ -159,7 +159,9 @@ que Target e Healer ainda exigem integração do backend de combate.
 Validação posterior: Node 497 testes, 489 aprovados, 8 ignorados, 0 falhas;
 Electron 497 aprovados, 0 ignorados, 0 falhas; build, smoke e audit exitCode 0.
 app-audit.json inclui target.comboUiContract aprovado: nativeSelected=true,
-unsupportedHotkey=false e undefinedInputs=0. Essa checagem utiliza o Electron
+hotkeyVisible=true, sequenceHidden=true e undefinedInputs=0. A hotkey do
+AutoCombo (`target.combo.nativeHotkey`, antes `combo.n`) aparece só no modo
+nativo; perfis antigos migram pelo validador. Essa checagem utiliza o Electron
 com simulação local, não o cliente real.
 
 O bot já aberto mantém o código carregado anteriormente. Para carregar a UI

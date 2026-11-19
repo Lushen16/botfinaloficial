@@ -62,6 +62,46 @@ test('target-only mode runs the target tick without healing or walking', async (
   await item.runtime.close();
 });
 
+test('native target rotates after delivered attack and fresh samples without HP loss', async context => {
+  const item = fixture();
+  context.after(() => item.runtime.close());
+  item.config.target = { monsters: ['*'], maxDistance: 8 };
+  const telemetry = item.sessionValue.telemetry;
+  telemetry.creatures.push({ ...creature, id: 13, pos: { x: 102, y: 100, z: 7 } });
+  const attackIds = () => item.commands.filter(command => command.name === 'attack').map(command => command.parameter);
+  await item.runtime.setModules('target', true, 10, item.config);
+  await item.runtime.tick();
+  assert.deepEqual(attackIds(), [12]);
+
+  item.time(12000);
+  await item.runtime.tick();
+  assert.ok(attackIds().every(id => id === 12), 'a repeated tick does not count as fresh');
+  telemetry.tick += 1;
+  await item.runtime.tick();
+  assert.ok(attackIds().every(id => id === 12), 'one fresh sample does not rotate');
+  telemetry.tick += 1;
+  await item.runtime.tick();
+  assert.equal(attackIds().at(-1), 13);
+});
+
+test('native target keeps a target whose HP drops on a fresh sample', async context => {
+  const item = fixture();
+  context.after(() => item.runtime.close());
+  item.config.target = { monsters: ['*'], maxDistance: 8 };
+  const telemetry = item.sessionValue.telemetry;
+  telemetry.creatures.push({ ...creature, id: 13, pos: { x: 102, y: 100, z: 7 } });
+  await item.runtime.setModules('target', true, 10, item.config);
+  await item.runtime.tick();
+  item.time(11000);
+  telemetry.tick += 1;
+  await item.runtime.tick();
+  item.time(12000);
+  telemetry.tick += 1;
+  telemetry.creatures[0].healthPercent -= 10;
+  await item.runtime.tick();
+  assert.equal(item.commands.filter(command => command.name === 'attack').at(-1)?.parameter, 12);
+});
+
 test('walker-only mode sends a real engine walk decision, not a target command', async () => {
   const item = fixture();
   await item.runtime.setModules('walker', true, 10, item.config);
@@ -92,13 +132,30 @@ test('the periodic runtime timer drives the engines after activation', { timeout
   } finally { clearTimeout(timer); }
 });
 
-test('healer-only mode receives actual HP in telemetry and emits the potion hotkey', async () => {
+test('healer-only mode emits the potion hotkey at low Pokemon HP', async () => {
   const item = fixture();
-  item.sessionValue.telemetry.healthPercent = 30;
+  item.sessionValue.telemetry.ownPokemon = { healthPercent: 30 };
   await item.runtime.setModules('healer', true, 10, item.config);
   await item.runtime.tick();
   assert.deepEqual(item.commands.map(value => [value.name, value.parameter]), [['hotkey', 'F12']]);
   await item.runtime.close();
+});
+
+test('healer dispatches a numeric potion without requiring action', async context => {
+  const item = fixture();
+  context.after(() => item.runtime.close());
+  item.adapter.supportedCommands = ['potion', 'stop'];
+  item.adapter.capabilities = () => require('../reconstruction/capabilities.cjs')
+    .parseDeclaration({ ...FIXTURE_DECLARATION, commands: ['potion', 'stop'] });
+  item.config.healer = {};
+  item.config.hoenn = { potionHpPercent: 60, potionActionBar: 3 };
+  item.sessionValue.telemetry.ownPokemon = { healthPercent: 30 };
+
+  await item.runtime.setModules('healer', true, 10, item.config);
+  assert.deepEqual(item.runtime.modules, ['healer'], JSON.stringify(item.runtime.state));
+  const result = await item.runtime.tick();
+  assert.equal(result?.status, 'heal', JSON.stringify(result));
+  assert.deepEqual(item.commands.map(({ name, parameter }) => [name, parameter]), [['potion', 3]]);
 });
 
 test('null or missing HP is not treated as zero by the healer', async () => {
@@ -527,7 +584,40 @@ test('runtime dispatches native fallback through the actual protocol encoder', a
   await item.runtime.close();
 });
 
-test('runtime runs combo to revive with enemies visible and waits for roster confirmation', async () => {
+test('native sequence sends Medicine, AutoCombo and Revive once before yielding remaining targets', async context => {
+  const item = fixture();
+  context.after(() => item.runtime.close());
+  const { target } = item.config;
+  delete target.skills;
+  target.combo = { enabled: true, useNativeSequence: true, nativeHotkey: 'C',
+    useMedicineBeforeCombo: true, medicineHotkey: 'E', medicineDelayMs: 500,
+    stepDelay: 250, finishRemainingCount: 1 };
+  target.autoRevive = { enabled: true, hotkey: 'F', interval: 500, waitForPokemon: true };
+  item.config.hoenn.comboFallbackMs = 500;
+  await item.runtime.setModules('all', true, 10, item.config);
+  const hotkeys = () => item.commands.filter(event => event.name === 'hotkey').map(event => event.parameter);
+  await item.runtime.tick();
+  assert.deepEqual(hotkeys(), ['E']);
+  item.time(10499);
+  await item.runtime.tick();
+  assert.deepEqual(hotkeys(), ['E']);
+  item.time(10500);
+  await item.runtime.tick();
+  assert.deepEqual(hotkeys(), ['E', 'C']);
+  item.time(11000);
+  await item.runtime.tick();
+  assert.deepEqual(hotkeys(), ['E', 'C', 'F']);
+  item.time(11300);
+  assert.equal((await item.runtime.tick()).reason, 'await-active-pokemon', 'same sample cannot confirm Revive');
+  item.sessionValue.telemetry.tick += 1;
+  item.time(11400);
+  const resumed = await item.runtime.tick();
+  assert.equal(resumed.status, 'walking');
+  assert.equal(resumed.reason, 'finish-remaining');
+  assert.deepEqual(hotkeys(), ['E', 'C', 'F']);
+});
+
+test('runtime runs combo to revive with enemies visible and records timeout', async () => {
   const item = fixture();
   delete item.config.target.skills;
   item.config.target.combo = { enabled: true, sequenceText: 'm1, m2', stepDelay: 250 };
@@ -544,10 +634,8 @@ test('runtime runs combo to revive with enemies visible and waits for roster con
   assert.equal(item.commands.filter(event => event.parameter === 'F9').length, 1);
   item.time(15000);
   Object.assign(item.sessionValue.telemetry, { pokemonName: '', activeSlot: 0, roster: [], creatures: [] });
-  assert.equal((await item.runtime.tick()).status, 'revive');
+  assert.equal((await item.runtime.tick()).reason, 'revive-timeout');
   item.time(15001);
-  Object.assign(item.sessionValue.telemetry, { pokemonName: 'Charizard', activeSlot: 1,
-    roster: [{ slot: 1, uuid: 'uuid', name: 'Charizard' }] });
   assert.equal((await item.runtime.tick()).status, 'walking');
   assert.equal(item.commands.filter(event => event.parameter === 'F9').length, 1);
   await item.runtime.close();

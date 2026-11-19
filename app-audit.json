@@ -106,7 +106,8 @@
         "passed": true,
         "detail": {
           "nativeSelected": true,
-          "unsupportedHotkey": false,
+          "hotkeyVisible": true,
+          "sequenceHidden": true,
           "undefinedInputs": 0
         }
       },

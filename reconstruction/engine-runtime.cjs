@@ -8,6 +8,7 @@ const { mergeCreatureSnapshot } = require('../tools/creature_bridge.cjs');
 const nativeAdapter = require('./native-adapter.cjs');
 const { CaptureRuntime } = require('./capture-runtime.cjs');
 const { createTargetEngine } = require('./engines/target-engine.cjs');
+const { createPathPlanner } = require('./pathfinder.cjs');
 
 const MODULES = Object.freeze(['target', 'walker', 'healer']);
 
@@ -17,6 +18,10 @@ class EngineRuntime extends EventEmitter {
     this.now = options.now || Date.now;
     this.openAdapter = options.openAdapter || nativeAdapter.open;
     this.creatureSource = options.creatureSource;
+    /* Mapa OTMM para o walker. Quem chama decide a fonte (aba do mapa, mapa
+     * padrao); sem provider o motor segue guloso. */
+    this.mapProvider = typeof options.mapProvider === 'function' ? options.mapProvider : null;
+    this.stepPlanner = null;
     this.intervalMs = options.intervalMs ?? 50;
     this.timeoutMs = options.timeoutMs ?? 1500;
     this.automatic = options.automatic !== false;
@@ -48,6 +53,14 @@ class EngineRuntime extends EventEmitter {
   get sessions() {
     const session = this.adapter?.getSnapshot();
     return session ? [session] : [];
+  }
+
+  /* Planejador reaproveitado entre automacoes: o cache dele vale por alguns
+   * ticks e recriar a cada connect perderia a serie. */
+  plannerFor() {
+    if (!this.mapProvider) return undefined;
+    this.stepPlanner ??= createPathPlanner({ getMap: this.mapProvider, now: this.now });
+    return this.stepPlanner;
   }
 
   /* Declaracao do servidor. SOMENTE `adapter.capabilities()` conta.
@@ -152,6 +165,7 @@ class EngineRuntime extends EventEmitter {
       this.config = structuredClone(config);
       this.automation = createAutomation(structuredClone(config), { now: this.now,
         isEnabled: name => this.modules.includes(name),
+        stepPlanner: this.plannerFor(),
         hotkeysBlocked: () => this.lastHotkeyAt !== null && this.now() - this.lastHotkeyAt < 250 });
       this.configSignature = signature;
     }
@@ -458,6 +472,7 @@ class EngineRuntime extends EventEmitter {
       this.config = structuredClone(config || {});
       this.automation = createAutomation(structuredClone(config || {}), { now: this.now,
         isEnabled: name => this.modules.includes(name),
+        stepPlanner: this.plannerFor(),
         hotkeysBlocked: () => this.lastHotkeyAt !== null && this.now() - this.lastHotkeyAt < 250 });
       this.configSignature = JSON.stringify(config);
     }
@@ -492,7 +507,9 @@ class EngineRuntime extends EventEmitter {
       const recorder = createRecorder();
       let captureCandidate = null;
       const result = this.automation.tick(snapshot, recorder, (telemetry, inCombat) => {
-        captureCandidate = this.capture.plan(telemetry, this.config, this.now(), { inCombat });
+        const canCapture = this.declaration().commands.includes('useWith')
+          && this.adapter.supportedCommands.includes('useWith');
+        captureCandidate = this.capture.plan(telemetry, this.config, this.now(), { inCombat, canCapture });
         if (this.lastHotkeyAt !== null && this.now() - this.lastHotkeyAt < 250) return null;
         if (captureCandidate) {
           const latest = this.snapshot();
@@ -540,6 +557,9 @@ class EngineRuntime extends EventEmitter {
         const ack = await this.bounded(() => adapter.command(event.name, event.parameter,
           { pid: this.pid, extra: event.extra }), event.name);
         if (ack !== true) throw Error('Comando sem ACK positivo: ' + event.name);
+        if (event.name === 'attack' && epoch === this.epoch) {
+          this.automation.recordAttackDelivery(event.parameter, current.telemetry, this.now());
+        }
         if (event.name === 'useWith' && captureCandidate) this.capture.record(captureCandidate, this.config, this.now(), true);
         if (event.name === 'walk') this.moving = true;
         if (event.name === 'attack') this.engaged = true;

@@ -5,6 +5,21 @@ Leia só este arquivo. Ele aponta o resto por caminho, não por cópia.
 
 Data: 2026-11-16.
 
+> **2026-11-19 — cliente atualizado pelo launcher, RVAs de `.data` re-derivados.**
+> O exe mudou (34.287.664 bytes, mtime 19/11 14:35:34) e todos os RVAs de
+> `.data` da DLL caíram: `runtimeReady` falso, posição sentinela, `attack`
+> recusado com `targetId=0`. Antes de culpar o motor, confira
+> `(Get-Item native\pka_native.dll).LastWriteTime` contra o `StartTime` do
+> processo e um `live-preflight.cjs --verify`.
+> Corrigido em `native/pka_native.c` (RUNTIME `0x39F68E0`, global do
+> LocalPlayer `0x39F8E08`, TEXT_CTX/GATE/REENTRY `0x39F8E48/0x39F8F48/0x39F8F4A`,
+> vtable do player `0x1FDB2A8`). Build e preflight verdes em 19/11; evidência e
+> método em `docs/MISSOES/vereditos/00-sessao-2026-11-19.md`.
+> Achados abertos: walker encerra `walk` a 1 tile (`arrived-within-one-tile`) e o
+> `live_walk_channel` aprova assim; `recallPokemon` é recusado (`status 1`);
+> o pulso publica `"roster":[]`, `"items":[]` e `"tiles":[]` fixos.
+
+
 ---
 
 ## 1. Onde você trabalha
@@ -44,9 +59,14 @@ Três frentes de código que **não se misturam**:
 ### Armadilha dos dois walker-engine
 
 ```
-reconstruction/engines/walker-engine.cjs   ~6 KB   ← o clone usa ESTE
+reconstruction/engines/walker-engine.cjs   ~25 KB  ← o clone usa ESTE
 botfinal/engines/walker-engine.cjs         ~13 KB  ← outra frente
 ```
+
+Os tamanhos citados antes (6 KB no clone) estavam defasados: o motor do clone
+recebeu reconciliacao por tick, piso de cadencia, guarda de orbita e, em
+2026-11-18, tolerancia de chegada para `box`/`safespot`. Sempre conferir o
+arquivo, nao a lembranca.
 
 `reconstruction/automation.cjs:4` importa `./engines/walker-engine.cjs`.
 Um teste em `botfinal/tests` **não prova nada** sobre o clone.
@@ -62,12 +82,12 @@ node tools/ui_audit.cjs
 
 ## 3. Estado atual (medido agora)
 
-`validation.json`, gerado em 2026-11-16T18:12:41Z (`node tools/validate.cjs`):
+`validation.json`, gerado em 2026-11-18 (`node tools/validate.cjs`):
 
 ```
   build    exit 0
-  node     878 testes, 870 pass, 0 fail, 8 skip
-  electron 878 testes, 878 pass, 0 fail
+  node     959 testes, 951 pass, 0 fail, 8 skip
+  electron 959 testes, 959 pass, 0 fail
   smoke    exit 0
   audit    exit 0
   success  true
@@ -75,8 +95,63 @@ node tools/ui_audit.cjs
 
 Tudo verde. **Não quebre isso.**
 
-A execução anterior (17:42:51Z) estava vermelha com 2 EPERM de symlink em
-`settings.test.cjs` e com o Electron falhando em `smoke`/`audit`. O que sobrou
+### O que estava quebrado e foi corrigido em 2026-11-18
+
+O número de testes subiu de 878 para 959 (novos casos de contrato e de walker).
+A suíte estava vermelha e o `validation.json` velho escondia isso — três causas,
+todas fora do motor em si:
+
+1. `reconstruction/transport.cjs` passou a consumir kind 6 em `emit('automation')`
+   e a retornar antes de `emit('frame')`. `botfinal/core/pipe-transport.cjs`
+   depende de `'frame'` para aprender o `boot` da sessão → 3 testes de
+   `botfinal/tests/automation_native_loop.test.cjs` falhavam. Correção: todo
+   frame continua emitindo `'frame'`, inclusive os que ganharam evento dedicado.
+2. `reconstruction/local-runtime.cjs` não declarava `action`, mas o Healer
+   **exige** `action` por default (`hoenn.potionHpPercent: 60` +
+   `potionActionBar: 3`). O start do Healer era recusado por capacidade e a
+   auditoria da UI falhava em `healer.healCommand`/`healer.switchConfirm` sem
+   emitir comando. Correção: `action` entrou em `SIMULATED_COMMANDS` (aceito,
+   não modelado).
+3. `native/pka_native.c` lia `name` como buffer inline, mas o campo é
+   `std::string` do MSVC. Nome com 16+ bytes sai do SSO e vira ponteiro; todos
+   os layouts eram reprovados e a DLL aceitava falso positivo, publicando
+   `(0,0,0)` e HP 0 **com `runtimeReady: true`**. Correção: `read_name_from`
+   trata SSO e heap. **Segundo caso medido ao vivo (PID 9500, mesmo build):**
+   `size=0` e texto terminado em NUL no ponteiro — exigir `size>0` reprovava o
+   jogador válido. `size` passou a ser opcional; `cap` limita a leitura.
+   O probe `tools/live_probe.py` tinha 3 defeitos próprios corrigidos no mesmo
+   dia: ordem de vtable (usava o RVA de build antigo), nome inline em vez de
+   ponteiro e campo `stable` ausente na resposta de `sample`.
+4. `box`/`safespot` exigiam o tile exato e orbitavam quando uma criatura estava
+   em cima do waypoint (medido: 300 comandos, `stuck` nunca). Correção em duas
+   partes: guarda de progresso (`ORBIT_SAMPLES`, encerra a órbita) e chegada
+   tolerada no vizinho quando o tile está ocupado por criatura viva
+   (`arrived-adjacent`). Teste discriminante: sem a regra, 4 casos falham.
+5. O gate aceitava posição sentinela: `(0,0,0)` e `(65535,65535,255)` são
+   inteiros e passavam em `no-position`. Agora `realPosition` recusa as duas
+   (`shared.cjs`, `automation.cjs`), com teste. Ver
+   `docs/PROTOCOLO_VALIDACAO.md` para a validação no cliente.
+6. O walker não contornava parede: era guloso com `clockwise`. Agora há
+   planejador A* sobre o mapa OTMM (`reconstruction/pathfinder.cjs`), ligado
+   pelo `EngineRuntime.mapProvider` (mapa da aba). A guarda de órbita passou a
+   medir **custo de caminho**, não distância em reta; sem mapa, o passo volta a
+   ser guloso. `tests/walker_pathfinder.test.cjs` cobre desvio, quina, bloco
+   desconhecido, alvo bloqueado e parede longa.
+7. Item do Healer: `potion` usa hotkey quando existe e cai no **`potion`
+   numérico** (slot) quando não há — a DLL executa potion, não `action`.
+   Medicine não tem equivalente numérico: `useMedicine: true` sem hotkey agora
+   **exige `hotkey` no start** (`capabilities.cjs`), em vez de iniciar e travar
+   em `medicine-channel-missing` a cada tick.
+8. Consumíveis das Tools (4 slots) passaram a rodar: `consumables-engine.cjs`,
+   um `hotkey` por tick, imediato ao ativar, repetindo em 10/20/30 s e depois
+   no intervalo configurado. Slot ligado exige `hotkey` no start. Ainda sem
+   motor: Hoenn, Safe Logout, Instância e `guildDaily` (o IPC continua stub).
+9. Escada direcional: `stairs` agora usa `param` (`north/east/south/west`) para
+   UM passo de saída antes de esperar o `z`; vazio continua "só pisar no tile".
+   Antes o `param` era ignorado e a escada terminava em `stairs-timeout`.
+   `tests/walker_stairs_direction.test.cjs` cobre.
+
+A execução de 2026-11-16T17:42:51Z também tinha 2 EPERM de symlink. O que sobrou
 disso, para não ser redescoberto:
 
 - Os EPERM **não** eram bug de produto: só aparecem com `TEMP`/`TMP` dentro do

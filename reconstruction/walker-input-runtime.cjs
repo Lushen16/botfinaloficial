@@ -4,6 +4,7 @@ const { EventEmitter } = require('node:events');
 const { execFile } = require('node:child_process');
 const path = require('node:path');
 const { createWalkerEngine, STEP_INTERVAL_MS } = require('./engines/walker-engine.cjs');
+const { createPathPlanner } = require('./pathfinder.cjs');
 
 function positionIssue(session, pid, playerName, now = Date.now()) {
   const age = now - Date.parse(session?.generatedAt);
@@ -69,6 +70,8 @@ class WalkerInputRuntime extends EventEmitter {
     this.playerName = options.playerName || '';
     this.input = options.input || createKeyboardInput();
     this.now = options.now || Date.now;
+    this.stepPlanner = typeof options.mapProvider === 'function'
+      ? createPathPlanner({ getMap: options.mapProvider, now: this.now, cardinalOnly: true }) : null;
     this.automatic = options.automatic !== false;
     this.pid = null;
     this.modules = [];
@@ -125,7 +128,8 @@ class WalkerInputRuntime extends EventEmitter {
     const waypoints = config?.walker?.waypoints;
     if (!Array.isArray(waypoints) || !waypoints.length) throw Error('A rota precisa de waypoints.');
     if (waypoints.some(waypoint => !this.allowedActions.includes(waypoint.action))) throw Error('Walker teclado aceita somente ' + this.allowedActions.join(', ') + '; outras acoes precisam do backend correspondente.');
-    const engine = createWalkerEngine({ ...config, walker: { ...config.walker, smartWalking: true } });
+    const engine = createWalkerEngine({ ...config, walker: { ...config.walker, smartWalking: true } },
+      { stepPlanner: this.stepPlanner });
     for (const waypoint of engine.waypoints()) {
       const pos = waypoint.pos;
       if (pos.x < 0 || pos.x >= 65535 || pos.y < 0 || pos.y >= 65535 || pos.z < 0 || pos.z > 15) throw Error('Waypoint fora dos limites.');

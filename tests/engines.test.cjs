@@ -45,13 +45,21 @@ test('readiness gates block every engine before sending', () => {
   for (const patch of [{ online: false }, { stale: true }, { error: 'x' }, { authExpired: true },
     { ageMs: 1001 }, { paused: true }, { runtime: { paused: true, modules: ['target'], pid: 10 } },
     { telemetry: { nativeVerified: false } }, { telemetry: { pulseVersion: 2 } },
-    { runtime: { modules: ['target'], pid: 11 } }]) {
+    { runtime: { modules: ['target'], pid: 11 } },
+    { telemetry: { position: { x: 0, y: 0, z: 0 } } },
+    { telemetry: { position: { x: 65535, y: 65535, z: 255 } } }]) {
     const recorder = createRecorder();
     const result = automation.tick(snapshot({ creatures: [creature(1, 101, 100)] }, patch), recorder);
     assert.equal(result.status, 'blocked');
     assert.deepEqual(recorder.events, []);
   }
   assert.equal(gateReason(snapshot()), null);
+  /* Sentinelas tem motivo declarado, nao `null`: o gate precisa recusar antes
+   * de o walker ver a posicao falsa. */
+  assert.equal(gateReason(snapshot({ position: { x: 0, y: 0, z: 0 } })), 'no-position');
+  assert.equal(gateReason(snapshot({ position: { x: 65535, y: 65535, z: 255 } })), 'no-position');
+  /* (0,0,x) parcial e' coordenada real (waypoint 0,0 e' valido). */
+  assert.equal(gateReason(snapshot({ position: { x: 0, y: 1, z: 7 } })), null);
 });
 
 test('walker steps one tile per tick and reports the direction', () => {
@@ -222,7 +230,7 @@ test('healer prefers the hotkey, honours cooldown, and only does one action per 
   const engine = createHealerEngine({ healer: { healHpPercent: 55, healPokemonName: 'Charizard', healMoveSlot: 1, healResetSlot: 2 },
     hoenn: { potionHpPercent: 60, potionHotkey: 'F1', potionCooldownMs: 5000 } });
   const recorder = createRecorder();
-  const telemetry = { healthPercent: 40, conditions: [], roster, pokemonName: 'Charizard', activeSlot: 1 };
+  const telemetry = { healthPercent: 40, ownPokemon: { healthPercent: 40 }, conditions: [], roster, pokemonName: 'Charizard', activeSlot: 1 };
   assert.deepEqual(engine.step(telemetry, recorder, 0).emitted, [['hotkey', 'F1']]);
   assert.deepEqual(engine.step(telemetry, recorder, 400).emitted, [['talk', 'm1']]);
   assert.deepEqual(engine.step(telemetry, recorder, 1500).emitted, [['talk', 'm1']]);
@@ -240,14 +248,25 @@ test('healer uses medicine for conditions on its own cooldown', () => {
   assert.deepEqual(engine.step(telemetry, recorder, 1600).emitted, [['hotkey', 'F2']]);
 });
 
-test('healer falls back to the action bar and blocks when no channel exists', () => {
+test('healer emits a numeric potion for the configured slot and blocks when no channel exists', () => {
   const engine = createHealerEngine({ healer: { healHpPercent: 0 }, hoenn: { potionHpPercent: 60, potionHotkey: '', potionActionBar: 3 } });
   const recorder = createRecorder();
-  assert.deepEqual(engine.step({ healthPercent: 50, roster }, recorder, 0).emitted, [['action', 3]]);
+  const telemetry = { healthPercent: 100, ownPokemon: { healthPercent: 50 }, roster };
+  assert.deepEqual(engine.step(telemetry, recorder, 0).emitted, [['potion', 3]]);
   const missing = createHealerEngine({ healer: { healHpPercent: 0 }, hoenn: { potionHpPercent: 60, potionHotkey: '', potionActionBar: 0 } });
-  const result = missing.step({ healthPercent: 50, roster }, createRecorder(), 0);
+  const result = missing.step(telemetry, createRecorder(), 0);
   assert.deepEqual(result.emitted, []);
   assert.deepEqual(result.blocked, ['potion-channel-missing']);
+});
+
+test('healer requires a hotkey for medicine even with a configured slot', () => {
+  const telemetry = { conditions: ['poison'], roster };
+  const config = { useMedicine: true, medicineActionBar: 4 };
+  const missing = createHealerEngine({ hoenn: config }).step(telemetry, createRecorder(), 0);
+  assert.deepEqual(missing.emitted, []);
+  assert.ok(missing.blocked.includes('medicine-channel-missing'));
+  const configured = createHealerEngine({ hoenn: { ...config, medicineHotkey: 'F4' } });
+  assert.deepEqual(configured.step(telemetry, createRecorder(), 0).emitted, [['hotkey', 'F4']]);
 });
 
 test('healer swaps back to the return pokemon after the heal cycle', () => {
@@ -270,7 +289,7 @@ test('automation heals before fighting and walks while luring', () => {
   let clock = 0;
   const automation = createAutomation(configValue, { now: () => clock });
   const recorder = createRecorder();
-  const hurt = automation.tick(snapshot({ healthPercent: 40, creatures: [creature(1, 101, 100), creature(2, 102, 100), creature(3, 103, 100)] }), recorder);
+  const hurt = automation.tick(snapshot({ ownPokemon: { healthPercent: 40 }, creatures: [creature(1, 101, 100), creature(2, 102, 100), creature(3, 103, 100)] }), recorder);
   assert.equal(hurt.status, 'heal');
   clock = 1500;
   const luring = automation.tick(snapshot({ healthPercent: 90, creatures: [creature(1, 101, 100)] }), recorder);
@@ -593,7 +612,7 @@ test('healer and combat share the global hotkey cooldown', () => {
   const automation = createAutomation(config({ target: { skills: [{ key: 'F2' }] },
     hoenn: { potionHpPercent: 50, potionHotkey: 'F1', potionCooldownMs: 1000 } }),
   { now: () => now });
-  assert.deepEqual(automation.tick(snapshot({ healthPercent: 40 })).emitted, [['hotkey', 'F1']]);
+  assert.deepEqual(automation.tick(snapshot({ ownPokemon: { healthPercent: 40 } })).emitted, [['hotkey', 'F1']]);
   now = 100;
   assert.deepEqual(automation.tick(snapshot({ creatures: [creature(7, 101, 100)] })).emitted,
     [['attack', 7]]);
@@ -639,6 +658,20 @@ test('native autocombo triggers hotkey when configured', () => {
   assert.equal(result.action, 'combo');
   assert.equal(result.native, true);
   assert.deepEqual(recorder.events.map(event => [event.name, event.parameter]), [['attack', 7], ['hotkey', 'F5']]);
+});
+
+test('combo Medicine handles debuff without consuming the AutoCombo hotkey', () => {
+  const engine = createTargetEngine(config({ target: {
+    combo: { enabled: true, useNativeSequence: true, nativeHotkey: 'C',
+      useMedicine: true, medicineHotkey: 'E', medicineDelayMs: 100 },
+  } }));
+  const telemetry = { position: { x: 100, y: 100, z: 7 }, conditions: ['poison'],
+    creatures: [creature(7, 101, 100)] };
+  const recorder = createRecorder();
+  assert.equal(engine.step(telemetry, recorder, 0).reason, 'medicine-sent');
+  assert.equal(engine.step(telemetry, recorder, 99).reason, 'medicine-wait');
+  engine.step({ ...telemetry, conditions: [] }, recorder, 100);
+  assert.deepEqual(recorder.events.filter(event => event.name === 'hotkey').map(event => event.parameter), ['E', 'C']);
 });
 
 test('native autocombo falls back to !autocombo when sequence is empty and no hotkey', () => {

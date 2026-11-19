@@ -3,6 +3,20 @@
 const DIRECTIONS = Object.freeze({ north: 0, east: 1, south: 2, west: 3, northeast: 4, southeast: 5, southwest: 6, northwest: 7 });
 
 const isPosition = value => Boolean(value) && [value.x, value.y, value.z].every(Number.isInteger);
+/* Posicao de TELEMETRIA que nao e' sentinela.
+ *
+ * `isPosition` cobre a forma; aqui o conteudo. Duas sentinelas ja observadas no
+ * cliente, ambas "validas" como inteiros:
+ *   (0,0,0)             menu / leitura falha
+ *   (65535,65535,255)   transicao
+ * Nao sao coordenadas: aceitar entrega posicao falsa ao walker e passa pelo
+ * gate de prontidao (foi assim que o layout falso por nome de 16 bytes chegava
+ * ao motor). Waypoint (0,0,0) continua valido — por isso a checagem e' separada
+ * de `isPosition`. */
+const realPosition = value => isPosition(value)
+  && !(value.x === 0 && value.y === 0 && value.z === 0)
+  && !(value.x === 65535 && value.y === 65535 && value.z === 255);
+
 const sameTile = (a, b) => Boolean(a) && Boolean(b) && a.x === b.x && a.y === b.y && a.z === b.z;
 const distance = (a, b) => {
   if (!isPosition(a) || !isPosition(b)) return Infinity;
@@ -63,7 +77,7 @@ function ready(snapshot) {
   if (!session.online || session.stale || session.error || session.authExpired) return false;
   if (Number(session.ageMs) > 1000) return false;
   if (!telemetry || telemetry.nativeVerified !== true || telemetry.pulseVersion !== 3) return false;
-  if (!isPosition(telemetry.position)) return false;
+  if (!realPosition(telemetry.position)) return false;
   /* Gate do runtime: `false` significa "no menu". `undefined` = DLL antiga,
    * que nao publica o campo — nesse caso nao bloqueamos, senao toda DLL
    * anterior a este campo ficaria inutil. */
@@ -108,6 +122,6 @@ function textFits(value, maximum, label) {
 }
 
 module.exports = {
-  DIRECTIONS, isPosition, sameTile, samePlane, distance, planeDistance, adjacent, direction, ignoredNames, normalizeName, matchesName, isIgnored,
+  DIRECTIONS, isPosition, realPosition, sameTile, samePlane, distance, planeDistance, adjacent, direction, ignoredNames, normalizeName, matchesName, isIgnored,
   parseSequence, byteLength, activePokemon, ready, runtimeMismatch, Cooldown, requirePositiveInteger, textFits,
 };

@@ -17,10 +17,13 @@ const { CONTRACT, VERSION, parseDeclaration } = require('./capabilities.cjs');
 
 /* Comandos que esta simulacao ACEITA. O resto ('follow', 'chase', ...) devolvia
  * `true` sem modelar nada — foi o que mascarou `chase` ate' a DLL real devolver
- * status 4 e derrubar a sessao. */
+ * status 4 e derrubar a sessao.
+ *
+ * Potion por slot é aceita para exercitar o contrato do Healer. O simulador
+ * registra o comando em lastCommand e não altera o HP por esse comando. */
 const SIMULATED_COMMANDS = Object.freeze([
   'walk', 'attack', 'stop', 'switchPokemon', 'recallPokemon', 'focus',
-  'talk', 'combo', 'hotkey',
+  'talk', 'combo', 'hotkey', 'action', 'potion',
 ]);
 /* Subconjunto que muda estado de verdade; os demais so' registram lastCommand. */
 const MODELLED_COMMANDS = Object.freeze([

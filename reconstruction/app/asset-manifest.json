@@ -221,7 +221,7 @@
     {
       "path": "target.js",
       "original": "renderer/target.js",
-      "sha256": "ffddfad98fbf469c340bd2480d572258560d3436ad1a136187dead8b462be629",
+      "sha256": "669e2b8225641c0b0c79b75c779c0174df4d0f768618b209b67464bd3b1b1cc1",
       "original_sha256": "ffddfad98fbf469c340bd2480d572258560d3436ad1a136187dead8b462be629",
       "preserved": false
     },
@@ -277,7 +277,7 @@
     {
       "path": "schema.js",
       "original": "shared/schema.js",
-      "sha256": "dd413e3f810a5860291e1347bdf10b7183cfc7f09bf76c7ed94b5e3d71ed220f",
+      "sha256": "8b157ab5d9f70893666d17604d81375d513df386386a06daf0e4995599ef8b46",
       "original_sha256": "8aa0fe77cbb90fa27ef132b20abf0951de0ba3e08fe81dd0d9f6e74be439e915",
       "preserved": true
     },

@@ -131,8 +131,10 @@ async function runAudit(window) {
     await simulate({ health: 100, creatures: wilds });
     await clickTab(1);
     await sleep(300);
-    const comboUi = await evaluate('(()=>{const mode=document.querySelector(".combo-mode.selected")?.dataset.mode;const native=document.querySelector(".combo-mode[data-mode=native]");native?.click();const result={nativeSelected:native?.getAttribute("aria-checked")==="true",unsupportedHotkey:!!document.querySelector("[data-setting-path=\\"target.combo.nativeHotkey\\"]"),undefinedInputs:[...document.querySelectorAll("#settings input")].filter(input=>input.value==="undefined").length};document.querySelector(".combo-mode[data-mode="+mode+"]")?.click();return result;})()');
-    record('target.comboUiContract', comboUi.nativeSelected && !comboUi.unsupportedHotkey && comboUi.undefinedInputs === 0, comboUi);
+    /* Combo nativo: a UI expoe a hotkey do AutoCombo no modo nativo e esconde a
+     * sequencia manual. O perfil antigo (`n`) tambem vale. */
+    const comboUi = await evaluate('(()=>{const mode=document.querySelector(".combo-mode.selected")?.dataset.mode;const native=document.querySelector(".combo-mode[data-mode=native]");native?.click();const key=document.querySelector("[data-setting-path=\\"target.combo.nativeHotkey\\"]")||document.querySelector("[data-setting-path=\\"target.combo.n\\"]");const seq=document.querySelector("[data-setting-path=\\"target.combo.sequenceText\\"]");const shown=e=>!!e&&e.getClientRects().length>0&&!e.closest("[hidden]");const result={nativeSelected:native?.getAttribute("aria-checked")==="true",hotkeyVisible:shown(key),sequenceHidden:!shown(seq),undefinedInputs:[...document.querySelectorAll("#settings input")].filter(input=>input.value==="undefined").length};document.querySelector(".combo-mode[data-mode="+mode+"]")?.click();return result;})()');
+    record('target.comboUiContract', comboUi.nativeSelected && comboUi.hotkeyVisible && comboUi.sequenceHidden && comboUi.undefinedInputs === 0, comboUi);
     let targetReady = await evaluate('!document.getElementById("run-module").disabled');
     if (!targetReady) {
       await evaluate('(()=>{const b=[...document.querySelectorAll("#settings button")].find(n=>/Adicionar/.test(n.textContent));if(b)b.click();return !!b;})()');

@@ -94,7 +94,7 @@
     {
       "id": "healer-potion-first",
       "config": { "hoenn": { "potionHpPercent": 60, "potionHotkey": "F1", "potionCooldownMs": 1500 } },
-      "telemetry": { "position": { "x": 100, "y": 100, "z": 7 }, "healthPercent": 40, "creatures": [] },
+      "telemetry": { "position": { "x": 100, "y": 100, "z": 7 }, "healthPercent": 40, "ownPokemon": { "name": "Charizard", "healthPercent": 40 }, "creatures": [] },
       "steps": [
         { "now": 0, "expect": { "status": "heal", "emitted": [["hotkey", "F1"]] } }
       ]

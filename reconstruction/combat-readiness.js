@@ -3,9 +3,7 @@
   const model = typeof module !== 'undefined' && module.exports ? module.exports : root.PkaDiagnostics;
   const originalTargetStartIssues = model.targetStartIssues;
   const keyboardUnsupported = new Set([
-    'target.combo.medicineHotkey',
     'target.combo.usePokeStop',
-    'target.autoRevive.hotkey',
   ]);
 
   /* ─── MOVIMENTO DO TREINADOR ───
@@ -70,6 +68,12 @@
 
   model.targetStartIssues = (config, session, options = {}) => {
     const issues = originalTargetStartIssues(config, session, options);
+    const combo = config?.target?.combo;
+    if (combo?.enabled === true && (combo.useMedicine || combo.useMedicineBeforeCombo)
+        && !combo.medicineHotkey?.trim() && !issues.some(issue => issue.path === 'target.combo.medicineHotkey')) {
+      issues.push({ action: 'config', path: 'target.combo.medicineHotkey',
+        message: 'Informe a hotkey de Medicine em Antes do combo.' });
+    }
     const movimento = movementIssues(config);
 
     if (options.blocked || options.apiAvailable === false || session?.source !== 'rpm'

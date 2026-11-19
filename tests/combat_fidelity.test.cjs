@@ -6,7 +6,7 @@ const { createAutomation, createRecorder } = require('../reconstruction/automati
 const { createTargetEngine } = require('../reconstruction/engines/target-engine.cjs');
 const { encodeCommand } = require('../reconstruction/protocol.cjs');
 
-const party = [{ slot: 1, name: 'Fighter', uuid: 'fighter' }, { slot: 2, name: 'Healer', uuid: 'healer' }];
+const party = [{ slot: 1, name: 'Fighter', uuid: 'fighter', healthPercent: 100 }, { slot: 2, name: 'Healer', uuid: 'healer' }];
 const wild = { id: 7, name: 'Wild', canAttack: true, healthPercent: 100, pos: { x: 101, y: 100, z: 7 } };
 function telemetry(patch = {}) {
   return { position: { x: 100, y: 100, z: 7 }, nativeVerified: true, pulseVersion: 3,
@@ -53,11 +53,11 @@ test('revive waits for a matching active roster, not an elapsed fixed delay', ()
   tick(0); tick(250); tick(1750);
   for (const patch of [{ pokemonName: '', activeSlot: 0, roster: [] }, { roster: [] },
     { activeSlot: 2 }, { roster: [...party, party[0]] }, { switchPending: true }]) {
-    const result = tick(5000, { creatures: [], ...patch });
+    const result = tick(4500, { creatures: [], ...patch });
     assert.equal(result.status, 'revive');
     assert.deepEqual(result.emitted, []);
   }
-  assert.equal(tick(5001, { creatures: [] }).status, 'walking');
+  assert.equal(tick(4501, { creatures: [] }).status, 'walking');
 });
 
 test('revive without waitForPokemon continues next tick without a synthetic delay', () => {
@@ -90,11 +90,13 @@ test('healer return stays pending until active name, slot and roster agree', () 
   assert.equal(tick(6001, { creatures: [] }).status, 'walking');
 });
 
-test('opaque native dispatch does not fabricate a completed rotation', () => {
+test('opaque native combo waits the fallback window before revive', () => {
   const { tick } = setup({ target: { combo: { enabled: true, useNativeSequence: true } } });
   assert.ok(tick(0).events.some(event => event.name === 'combo'));
-  const result = tick(10000);
-  assert.ok(!result.events.some(event => event.parameter === 'F9'));
+  /* Combo nativo sem hotkey: o fim e' opaco. A janela de fallback (3000 ms)
+   * impede o revive de sair no meio do combo. */
+  assert.ok(!tick(2999).events.some(event => event.parameter === 'F9'));
+  assert.ok(tick(3000).events.some(event => event.parameter === 'F9'));
 });
 
 

@@ -91,15 +91,15 @@ test('hunt revives after the last skill and waits for active roster confirmation
     return automation.tick({ pid: 10, online: true, ageMs: 0,
       telemetry: { nativeVerified: true, pulseVersion: 3, position: { x: 100, y: 100, z: 7 },
         playerName: 'Player', healthPercent: 100, creatures, activeSlot: active ? 1 : 0,
-        pokemonName: active ? 'Fighter' : '', roster: active ? [{ slot: 1, name: 'Fighter', uuid: 'fighter' }] : [] } });
+        pokemonName: active ? 'Fighter' : '', roster: active ? [{ slot: 1, name: 'Fighter', uuid: 'fighter', healthPercent: 100 }] : [] } });
   };
   const finalSkill = tick(1000, [creature], true);
   assert.equal(finalSkill.status, 'revive');
   assert.ok(finalSkill.emitted.some(([name, key]) => name === 'hotkey' && key === 'f1'));
   assert.deepEqual(tick(1499, [creature], true).emitted, []);
   assert.deepEqual(tick(1500, [creature], true).emitted, [['hotkey', 'f9']]);
-  assert.equal(tick(5000, []).status, 'revive');
-  const walking = tick(5001, [], true);
+  assert.equal(tick(4499, []).status, 'revive');
+  const walking = tick(4500, [], true);
   assert.equal(walking.status, 'walking');
   assert.equal(walking.pauseWalker, false);
 });

@@ -187,8 +187,16 @@ Não apagar nenhuma das duas; não duplicar features sem decisão explícita.
 
 ```
 botfinal/engines/walker-engine.cjs        ~13 KB  → pendingStep + _reconcile
-reconstruction/engines/walker-engine.cjs   ~6 KB  → o clone usa ESTE
+reconstruction/engines/walker-engine.cjs  ~25 KB  → o clone usa ESTE
 ```
+
+`~6 KB` era o tamanho do motor do clone em outubro/2026; ele cresceu com
+reconciliação por tick, piso de cadência, guarda de órbita, chegada tolerada
+para `box`/`safespot` (`arrived-adjacent`, 2026-11-18) e **pathfinding A\***
+sobre o mapa OTMM (`reconstruction/pathfinder.cjs`, ligado por
+`EngineRuntime.mapProvider`). Sem mapa o passo volta a ser guloso e a guarda de
+órbita mede distância em reta; com mapa, mede custo de caminho. Conferir o
+arquivo, não o número lembrado.
 
 `reconstruction/automation.cjs:4` importa `./engines/walker-engine.cjs`. Um
 teste em `botfinal/tests` **não** prova nada sobre o clone. Validar sempre pelo

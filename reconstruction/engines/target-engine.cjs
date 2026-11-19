@@ -5,6 +5,8 @@ const TargetEngine = require('../../target-engine.cjs');
 
 const { DEFAULT_GLOBAL_COOLDOWN_MS } = TargetEngine;
 const ATTACK_RETRY_MS = 300;
+const ATTACK_EFFECT_WINDOW_MS = 2000;
+const TARGET_RETRY_DELAY_MS = 4000;
 const SKILL_RETRY_MS = 300;
 /* PokeStop: manda o Pokemon ficar parado na box para os monstros chegarem.
  *
@@ -18,6 +20,12 @@ const SKILL_RETRY_MS = 300;
 const POKESTOP_TEXT = '!pokestop';
 const POKESTOP_ATTEMPTS = 4;
 const POKESTOP_RETRY_MS = 400;
+
+function nativeComboWaitMs(combo, hoenn) {
+  const fallback = hoenn?.comboFallbackMs;
+  return Math.max(Number(combo?.stepDelay) || 0,
+    Number.isFinite(fallback) && fallback > 0 ? fallback : 3000);
+}
 
 function rosterUuid(telemetry, name) {
   const slot = Number(telemetry.activeSlot);
@@ -125,7 +133,9 @@ function createTargetEngine(config, options = {}) {
   const perfectingLureEnabled = combo.perfectingLureEnabled === true || perfectLure;
   const state = {
     targetId: null, attackAt: new Cooldown(), attackDispatched: false, targetSince: null,
+    attackObservation: null, deferredTargets: new Map(),
     comboIndex: 0, comboAt: new Cooldown(), comboCompletedAt: null,
+    medicineAt: new Cooldown(), medicinePrepared: false, finishing: null,
     pokeStopTries: 0, pokeStopAt: new Cooldown(), comboPokemonName: null, lastSkillCommand: null, rotationKeys: new Set(),
     bestTileSince: null, bestTileDone: false, bestTileTries: 0, bestTileAt: new Cooldown(),
     healAt: new Cooldown(), lureAt: new Cooldown(), blocked: new Set(),
@@ -163,6 +173,18 @@ function createTargetEngine(config, options = {}) {
     return engine.filterCandidates(player, wilds(telemetry), settings);
   }
 
+  function finishCombo(telemetry) {
+    const remaining = candidates(telemetry, telemetry.position, engineConfig());
+    const finishCount = Number(combo.finishRemainingCount ?? 0);
+    if (remaining.length <= finishCount && (combo.finishIgnoreShiny === true || !remaining.some(isShiny))) {
+      clearTarget();
+      state.finishing = new Set(remaining.map(creature => creature.id));
+      return true;
+    }
+    restartCombo();
+    return false;
+  }
+
   function choose(player, pool, settings, ownPos) {
     const shiny = target.shinyPriorityEnabled === true ? pool.filter(isShiny) : [];
     const base = shiny.length ? shiny : pool;
@@ -174,6 +196,7 @@ function createTargetEngine(config, options = {}) {
   }
 
   function restartCombo() {
+    state.medicinePrepared = false;
     state.comboIndex = 0;
     state.comboCompletedAt = null;
     state.comboPokemonName = null;
@@ -196,7 +219,46 @@ function createTargetEngine(config, options = {}) {
     engine.clearTarget();
     state.targetId = null;
     state.attackDispatched = false;
+    state.attackObservation = null;
+    state.deferredTargets.clear();
+    state.finishing = null;
     restartCombo();
+  }
+
+  function observeAttack(telemetry, pool, now) {
+    const observation = state.attackObservation;
+    if (!observation) return;
+    const creature = pool.find(candidate => candidate.id === observation.id);
+    if (!creature || telemetry.playerId !== observation.playerId
+        || observation.lastTick - telemetry.tick >= 1000) {
+      state.attackObservation = null;
+      return;
+    }
+    const hp = creature.healthPercent;
+    if (telemetry.creaturesStale === true || !Number.isInteger(telemetry.tick)
+        || telemetry.tick <= observation.lastTick
+        || !Number.isFinite(hp) || hp < 0 || hp > 100) return;
+    if (hp < observation.hp) {
+      state.attackObservation = null;
+      return;
+    }
+    observation.hp = hp;
+    observation.lastTick = telemetry.tick;
+    observation.samples += 1;
+    if (observation.samples >= 2 && now - observation.deliveredAt >= ATTACK_EFFECT_WINDOW_MS) {
+      state.deferredTargets.set(observation.id, now + TARGET_RETRY_DELAY_MS);
+      state.attackObservation = null;
+    }
+  }
+
+  function recordAttackDelivery(id, telemetry, deliveredAt) {
+    const hp = telemetry.creatures?.find(creature => creature.id === id)?.healthPercent;
+    if (id !== state.targetId || state.attackObservation?.id === id
+        || telemetry.creaturesStale === true || !Number.isInteger(telemetry.tick)
+        || !Number.isFinite(hp) || hp <= 0 || hp > 100) return;
+    state.attackObservation = {
+      id, hp, playerId: telemetry.playerId, lastTick: telemetry.tick, deliveredAt, samples: 0,
+    };
   }
 
   /**
@@ -303,6 +365,12 @@ function createTargetEngine(config, options = {}) {
     const pool = inRange.length
       ? engine.filterCandidates(player, inRange, { ...settings, maxDistance: Number.MAX_SAFE_INTEGER })
       : [];
+    if (state.finishing) {
+      if (pool.length && pool.every(creature => state.finishing.has(creature.id))) {
+        return { action: 'idle', emitted: [], reason: 'finish-remaining' };
+      }
+      state.finishing = null;
+    }
     // Perfect lure para a rota com os selvagens na tela; sem ele vale o alcance da regra.
     const detected = perfectLure ? all.length : pool.length;
 
@@ -327,7 +395,12 @@ function createTargetEngine(config, options = {}) {
       clearTarget();
       return { action: 'luring', emitted: [], detected, needed: minWilds || target.monsters?.find(r => r?.minCount > 1)?.minCount || 1 };
     }
-    const creature = choose(player, pool, settings, telemetry?.ownPokemon?.pos);
+    observeAttack(telemetry, pool, now);
+    for (const [id, retryAt] of state.deferredTargets) {
+      if (now >= retryAt) state.deferredTargets.delete(id);
+    }
+    const available = state.deferredTargets.size ? pool.filter(candidate => !state.deferredTargets.has(candidate.id)) : pool;
+    const creature = choose(player, available.length ? available : pool, settings, telemetry?.ownPokemon?.pos);
     if (!creature) {
       clearTarget();
       if (detected > 0) {
@@ -342,6 +415,7 @@ function createTargetEngine(config, options = {}) {
     const send = (name, parameter, extra) => { sink.command(name, parameter, extra); emitted.push([name, parameter]); };
 
     if (state.targetId !== creature.id) {
+      state.attackObservation = null;
       state.targetId = creature.id;
       restartCombo();
       state.targetSince = now;
@@ -434,6 +508,27 @@ function createTargetEngine(config, options = {}) {
     if (!comboEnabled) return { action: emitted.length ? 'attack' : 'hold', emitted, targetId: creature.id };
     if (lowHpOnly) return { action: 'attack', emitted, targetId: creature.id, reason: 'low-hp-gate' };
 
+    const medicineKey = typeof combo.medicineHotkey === 'string' ? combo.medicineHotkey.trim() : '';
+    const prepareMedicine = combo.useMedicineBeforeCombo === true && state.comboIndex === 0 && !state.medicinePrepared;
+    const treatDebuff = combo.useMedicine === true && Array.isArray(telemetry.conditions)
+      && telemetry.conditions.length > 0 && state.medicineAt.ready(now, 1500);
+    const medicineDelay = Number.isFinite(combo.medicineDelayMs) && combo.medicineDelayMs >= 0
+      ? combo.medicineDelayMs : 50;
+    if (medicineKey && (prepareMedicine || treatDebuff)) {
+      if (!context.hotkeysBlocked && state.medicineAt.ready(now, 1500)) {
+        send('hotkey', medicineKey);
+        state.medicineAt.use(now);
+        state.medicinePrepared = true;
+        return { action: 'combat', emitted, targetId: creature.id, reason: 'medicine-sent' };
+      }
+      if (prepareMedicine) {
+        return { action: 'combat', emitted, targetId: creature.id, reason: 'medicine-wait' };
+      }
+    }
+    if (medicineKey && !state.medicineAt.ready(now, medicineDelay)) {
+      return { action: 'combat', emitted, targetId: creature.id, reason: 'medicine-wait' };
+    }
+
     if (combo.useNativeSequence === true) {
       const nativeHotkey = (typeof combo.nativeHotkey === 'string' && combo.nativeHotkey.trim())
         || (typeof combo.hotkey === 'string' && combo.hotkey.trim());
@@ -451,7 +546,8 @@ function createTargetEngine(config, options = {}) {
           }
           return { action: 'combat', emitted, targetId: creature.id, native: true };
         }
-        return { action: 'combat', emitted, targetId: creature.id, reason: 'combo-done', native: true };
+        return { action: 'combat', emitted, targetId: creature.id,
+          reason: state.comboAt.ready(now, nativeComboWaitMs(combo, hoenn)) ? 'combo-done' : 'await-combo-window', native: true };
       }
     }
 
@@ -548,11 +644,15 @@ function createTargetEngine(config, options = {}) {
             send('combo', '!autocombo', activeUuid ? { expectedUuid: activeUuid } : undefined);
             state.comboIndex += 1;
             state.comboAt.use(now);
+            state.comboCompletedAt = now;
+            state.comboPokemonName = telemetry.pokemonName;
+            state.lastSkillCommand = { name: 'combo', parameter: '!autocombo' };
             return { action: 'combo', emitted, targetId: creature.id, step: state.comboIndex, native: true };
           }
           return { action: 'combat', emitted, targetId: creature.id, native: true };
         }
-        return { action: 'combat', emitted, targetId: creature.id, reason: 'combo-done', native: true };
+        return { action: 'combat', emitted, targetId: creature.id,
+          reason: state.comboAt.ready(now, nativeComboWaitMs(combo, hoenn)) ? 'combo-done' : 'await-combo-window', native: true };
       }
       return { action: 'attack', emitted, targetId: creature.id, reason: 'empty-combo' };
     }
@@ -596,7 +696,9 @@ function createTargetEngine(config, options = {}) {
   return {
     step,
     healingAction,
+    finishCombo,
     recordHealing(timestamp) { state.healAt.use(timestamp); },
+    recordAttackDelivery,
     recordDispatch(name, parameter, timestamp) {
       if (name === 'hotkey') engine.recordDispatch(parameter, timestamp);
       if (name === 'attack') { state.attackAt.use(timestamp); state.attackDispatched = true; }
@@ -612,12 +714,13 @@ function createTargetEngine(config, options = {}) {
     restartCombo,
     reset() {
       engine = new TargetEngine({}, { now: () => tickNow });
-      restartCombo();
+      clearTarget();
       Object.assign(state, { targetId: null, attackDispatched: false, comboIndex: 0, comboAt: new Cooldown(),
-        healAt: new Cooldown(), lureAt: new Cooldown(), attackAt: new Cooldown(), blocked: new Set() });
+        healAt: new Cooldown(), lureAt: new Cooldown(), attackAt: new Cooldown(), medicineAt: new Cooldown(),
+        finishing: null, blocked: new Set() });
     },
     get state() { return { targetId: state.targetId, comboIndex: state.comboIndex, comboCompletedAt: state.comboCompletedAt, comboPokemonName: state.comboPokemonName, blocked: [...state.blocked] }; },
   };
 }
 
-module.exports = { createTargetEngine, ATTACK_RETRY_MS, SKILL_RETRY_MS, isShiny };
+module.exports = { createTargetEngine, nativeComboWaitMs, ATTACK_RETRY_MS, SKILL_RETRY_MS, isShiny };

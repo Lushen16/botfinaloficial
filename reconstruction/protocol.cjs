@@ -97,10 +97,17 @@ function encodeCommand(commandId, command, parameter = 0, options = {}) {
       bytes.writeUInt32LE(summonId, 16);
     }
     if (command === 'useWith') {
-      if (!inRange(parameter.itemId, 1, 65535) || !inRange(parameter.targetId, 1, 65535) || !inRange(parameter.stack, 0, 255)) fail("Item ou stack inv\u00e1lido.");
+      if (!inRange(parameter.itemId, 1, 65535) || !inRange(parameter.targetId, 1, 0xffffffff) || !inRange(parameter.stack, 0, 255)) fail("Item ou stack inv\u00e1lido.");
       bytes.writeUInt32LE(parameter.itemId, 8);
       bytes.writeUInt8(parameter.stack, 17);
       bytes.writeUInt32LE(parameter.targetId, 20);
+      /* Tecla da bola opcional no tail (a DLL posta a tecla; o alvo ja' vai
+       * em targetId). Limite de 24 bytes como as teclas de item. */
+      if (parameter.key !== undefined) {
+        if (typeof parameter.key !== 'string' || !parameter.key.length) fail("Tecla da bola inv\u00e1lida.");
+        text = Buffer.from(parameter.key, 'utf8');
+        if (text.length > 24) fail("Tecla da bola longa demais.");
+      }
     }
     identityOffset = 20;
   } else {

@@ -17,7 +17,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { isDeepStrictEqual } = require('node:util');
 const { WalkerInputRuntime, positionIssue } = require('./walker-input-runtime.cjs');
-const { createTargetEngine, ATTACK_RETRY_MS, isShiny } = require('./engines/target-engine.cjs');
+const { createTargetEngine, ATTACK_RETRY_MS } = require('./engines/target-engine.cjs');
+const { normalizeName } = require('./engines/shared.cjs');
 const { createHealerEngine } = require('./engines/healer-engine.cjs');
 const { mergeCreatureSnapshot } = require('../tools/creature_bridge.cjs');
 const { readBindings, projectTarget, createCombatInput } = require('./keyboard-combat.cjs');
@@ -269,7 +270,10 @@ class RpmCombatRuntime extends WalkerInputRuntime {
       const issue = positionIssue(session, pid, this.playerName, this.now());
       if (issue || !session?.capabilities.targetKeyboard) throw Error(issue || session?.capabilities.targetKeyboardIssue);
       const health = session.telemetry.healthPercent;
-      if (!Number.isFinite(health) || health < 0 || health > 100) throw Error('Healer exige telemetria real de HP.');
+      if (Number(config?.healer?.healHpPercent) > 0
+          && (!Number.isFinite(health) || health < 0 || health > 100)) {
+        throw Error('Healer exige telemetria real de HP para curar o treinador.');
+      }
       return session;
     };
     const session = validate();
@@ -545,10 +549,13 @@ class RpmCombatRuntime extends WalkerInputRuntime {
           if (this.revivePending.sentAt === null) {
             if (this.now() - this.revivePending.lastSkillAt >= interval && this.now() - this.lastDispatch >= this.combatGcd()) {
               const key = revive.hotkey.trim();
+              const pending = this.revivePending;
               const result = await this.combatInput(this.pid, { kind: 'key', key, playerName: this.playerName });
+              if (epoch !== this.epoch || this.revivePending !== pending) return null;
               this.lastDispatch = this.now();
               this.keyUsedAt.set(key.toLowerCase(), this.lastDispatch);
-              this.revivePending.sentAt = this.now();
+              pending.sentAt = this.lastDispatch;
+              pending.sentSnapshot = telemetry.creaturesGeneratedAt;
               const record = { ...result, generatedAt: new Date(this.lastDispatch).toISOString(),
                 command: 'hotkey', parameter: key, priority: 'revive', inputAccepted: true, effectVerified: false };
               this.dispatchLog.push(record); this.dispatchLog = this.dispatchLog.slice(-100);
@@ -561,32 +568,33 @@ class RpmCombatRuntime extends WalkerInputRuntime {
             this.changed(); return this.last;
           } else {
             const elapsedAfterSend = this.now() - this.revivePending.sentAt;
-            const isFinished = elapsedAfterSend >= 300 && (
-              revive.waitForPokemon !== true
-              || (telemetry.ownPokemon && telemetry.ownPokemon.healthPercent > 0)
-              || elapsedAfterSend > Math.max(1000, Number(this.config?.hoenn?.pokeReadyTimeoutMs ?? 3000))
-            );
+            const configuredTimeout = this.config?.hoenn?.pokeReadyTimeoutMs;
+            const timeout = Number.isFinite(configuredTimeout) && configuredTimeout > 0 ? configuredTimeout : 3000;
+            const hp = telemetry.ownPokemon?.healthPercent;
+            const confirmed = telemetry.creaturesGeneratedAt > this.revivePending.sentSnapshot
+              && Number.isFinite(hp) && hp > 0 && hp <= 100
+              && (!this.revivePending.pokemonName
+                || normalizeName(telemetry.ownPokemon.name) === normalizeName(this.revivePending.pokemonName));
+            const timedOut = revive.waitForPokemon === true && !confirmed && elapsedAfterSend >= timeout;
+            const isFinished = elapsedAfterSend >= 300
+              && (revive.waitForPokemon !== true || confirmed || timedOut);
             if (isFinished) {
               this.revivePending = null;
-              const remaining = this.combat.inspect(telemetry);
-              const finishCount = Number(this.config?.target?.combo?.finishRemainingCount ?? 0);
-              const finishIgnoreShiny = this.config?.target?.combo?.finishIgnoreShiny === true;
-              const hasShiny = remaining.some(isShiny);
-              if (remaining.length <= finishCount && (!hasShiny || finishIgnoreShiny)) {
+              if (this.combat.finishCombo(telemetry)) {
                 this.combatActive = false;
-                this.combat.clearTarget();
                 this.queue = [];
                 this.targetView = null;
                 this.lastCombatSnapshot = null;
-                this.last = { status: 'idle', action: 'finish-remaining', inputAccepted: false };
+                this.last = { status: 'idle', action: 'finish-remaining', inputAccepted: false,
+                  reviveOutcome: timedOut ? 'timeout' : confirmed ? 'confirmed' : 'not-requested' };
                 this.changed(); return this.last;
               } else {
                 this.combatActive = true;
-                this.combat.restartCombo(this.now());
                 this.queue = [];
                 this.targetView = null;
                 this.lastCombatSnapshot = null;
-                this.last = { status: 'combat', action: 'restart-combo', inputAccepted: false };
+                this.last = { status: 'combat', action: 'restart-combo', inputAccepted: false,
+                  reviveOutcome: timedOut ? 'timeout' : confirmed ? 'confirmed' : 'not-requested' };
                 this.changed(); return this.last;
               }
             } else {
@@ -633,24 +641,19 @@ class RpmCombatRuntime extends WalkerInputRuntime {
             this.revivePending = {
               lastSkillAt: this.combat.state.comboCompletedAt || this.now(),
               sentAt: null,
-              pokemonName: telemetry.pokemonName,
+              pokemonName: this.combat.state.comboPokemonName || telemetry.ownPokemon?.name,
             };
             this.last = { status: 'revive', action: 'waiting-interval', inputAccepted: false };
             this.changed(); return this.last;
           }
-          const finishCount = Number(this.config?.target?.combo?.finishRemainingCount ?? 0);
-          const finishIgnoreShiny = this.config?.target?.combo?.finishIgnoreShiny === true;
-          const hasShiny = candidates.some(isShiny);
-          if (candidates.length <= finishCount && (!hasShiny || finishIgnoreShiny)) {
+          if (this.combat.finishCombo(telemetry)) {
             this.combatActive = false;
-            this.combat.clearTarget();
             this.queue = [];
             this.targetView = null;
             this.lastCombatSnapshot = null;
             this.last = { status: 'idle', action: 'finish-remaining', inputAccepted: false };
             this.changed(); return this.last;
           } else {
-            this.combat.restartCombo(this.now());
             this.queue = [];
             this.targetView = null;
             this.lastCombatSnapshot = null;

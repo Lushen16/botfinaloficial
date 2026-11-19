@@ -50,7 +50,20 @@ function validateConfig(config) {
   const candidate = { ...config };
   if (object(candidate.tools)) candidate.tools = schema.migrateTools(candidate.tools);
   if (object(candidate.target)) candidate.target = { ...candidate.target, luring: walker.normalizeLuring(candidate.target.luring) };
-  return Object.fromEntries(schema.tabs.map(tab => [tab.key, validateFields(tab.fields, candidate[tab.key], tab.label)]));
+  const result = Object.fromEntries(schema.tabs.map(tab => [tab.key, validateFields(tab.fields, candidate[tab.key], tab.label)]));
+  /* Perfis antigos guardavam a hotkey do AutoCombo em `combo.n`. */
+  const legacyHotkey = candidate.target?.combo?.n;
+  if (object(candidate.target?.combo) && candidate.target.combo.nativeHotkey === undefined && legacyHotkey !== undefined) {
+    candidate.target = { ...candidate.target, combo: { ...candidate.target.combo, nativeHotkey: legacyHotkey } };
+  }
+  const nativeHotkey = candidate.target?.combo?.nativeHotkey;
+  if (nativeHotkey !== undefined) {
+    if (typeof nativeHotkey !== 'string' || Buffer.byteLength(nativeHotkey.trim(), 'utf8') > 255) {
+      throw Error('Hotkey AutoCombo inválida.');
+    }
+  }
+  if (nativeHotkey !== undefined && nativeHotkey.trim()) result.target.combo.nativeHotkey = nativeHotkey.trim();
+  return result;
 }
 function validateData(data) {
   if (!object(data) || data.version !== 1 || !Array.isArray(data.profiles) || !data.profiles.length) throw Error('Formato de configurações não suportado.');

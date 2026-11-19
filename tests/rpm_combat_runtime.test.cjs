@@ -579,11 +579,11 @@ test('Healer module has priority over an existing combat queue and preserves Wal
   const walker = value.runtime.engine;
   value.config.hoenn = { potionHpPercent: 50, potionHotkey: 'F12', potionCooldownMs: 1500 };
   await value.start('healer');
-  value.telemetry.healthPercent = 20; value.advance();
+  value.telemetry.creatures.find(entry => entry.isOwnPokemon).healthPercent = 20; value.advance();
   assert.equal((await value.runtime.tick()).status, 'heal');
   assert.equal(value.events.filter(event => event.request).at(-1).request.key, 'F12');
   assert.deepEqual(value.runtime.queue, queue);
-  value.telemetry.healthPercent = 80; value.advance(); await value.runtime.tick();
+  value.telemetry.creatures.find(entry => entry.isOwnPokemon).healthPercent = 80; value.advance(); await value.runtime.tick();
   assert.equal(value.events.at(-1).request.key, 'F1');
   assert.equal(value.runtime.engine, walker);
   await value.runtime.setModules('healer', false);
@@ -591,10 +591,9 @@ test('Healer module has priority over an existing combat queue and preserves Wal
   assert.equal(value.runtime.paused, false);
 });
 
-test('Healer-only mode requires actual HP, survives pause, and stays active when Walker stops', async () => {
+test('Pokemon potion works without trainer HP and stays active when Walker stops', async () => {
   const value = fixture(); value.config.hoenn = { potionHpPercent: 50, potionHotkey: 'F12' };
-  await assert.rejects(value.start('healer'), /telemetria real de HP/);
-  value.telemetry.healthPercent = 20;
+  value.telemetry.creatures.find(entry => entry.isOwnPokemon).healthPercent = 20;
   await value.start('healer');
   assert.equal((await value.runtime.tick()).status, 'heal');
   await value.runtime.togglePause(); await value.runtime.togglePause();
@@ -683,6 +682,7 @@ test('reconfiguration during a dispatch cannot mark a new target engine as alrea
 
 test('Healer retry cooldown starts at accepted dispatch, not at planning time', async () => {
   const value = fixture(); value.telemetry.healthPercent = 20;
+  value.telemetry.creatures.find(entry => entry.isOwnPokemon).healthPercent = 20;
   value.config.hoenn = { potionHpPercent: 50, potionHotkey: 'F12', potionCooldownMs: 1500 };
   await value.start('healer');
   const accepted = value.runtime.combatInput;
