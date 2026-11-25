@@ -82,3 +82,7 @@ artifacts/
 # Nome do personagem do operador (dado pessoal)
 native/pka_player_name.txt
 
+
+# Rascunhos locais (nao publicar)
+scratch_*
+
