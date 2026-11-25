@@ -142,10 +142,33 @@ pendência de combate; blind sozinho não prova ausência.
 
 O painel da conexão mostra canal informado, intervalo configurado, sequência,
 idade e disponibilidade de criaturas/itens. Não muda a configuração.
+O intervalo configurado e o intervalo efetivo informado são campos separados.
+O segundo lê exclusivamente `effectiveIntervalMs` dos metadados da sessão ou
+do runtime com o mesmo PID. Sem essa informação explícita, mostra `—`; não
+deduz a cadência pelo canal nem atesta a frequência de leituras.
 Metadados do runtime só são usados quando o PID corresponde ao selecionado.
 Valores ausentes são exibidos como `—` ou sem informação, nunca inventados.
 Um erro explícito de build não suportado pede uma versão compatível; o painel
 não descobre perfis nem inicia comandos.
+
+## Migração de configurações antigas
+
+`migrateTelemetry` trata um modo antigo desconhecido usando o valor padrão
+já declarado em `TELEMETRY_DEFAULTS`. Preserva os demais campos e não altera
+o objeto fornecido pelo chamador. Quando existem as duas representações,
+`tools.telemetry` tem precedência sobre `telemetry`, como na normalização.
+
+`validateTelemetry` e `validateConfig` permanecem estritos para uma atribuição
+explícita de modo inválido. A migração não encobre outros erros, como intervalo
+fora dos limites ou hash malformado. Os testes cobrem a função de migração;
+não demonstram que todo caminho de inicialização de perfil persistido passe
+por ela antes da validação.
+
+Verificações específicas:
+
+```powershell
+node --test tests/telemetry_migration.test.cjs tests/telemetry_status_effective_interval.test.cjs tests/telemetry_status_ui.test.cjs tests/settings.test.cjs
+```
 
 ## Verificação offline reproduzível
 

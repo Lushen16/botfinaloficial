@@ -40,7 +40,9 @@
       && Number.isInteger(runtime.pid) && runtime.pid === session.pid;
     const runtimeTelemetry = matchingRuntime ? runtime.telemetry ?? {} : {};
     const mode = telemetry.mode ?? telemetry.source ?? runtimeTelemetry.mode;
-    const interval = telemetry.intervalMs ?? runtimeTelemetry.intervalMs ?? configured?.intervalMs;
+    const interval = configured.intervalMs ?? telemetry.configuredIntervalMs ?? runtimeTelemetry.configuredIntervalMs
+      ?? telemetry.intervalMs ?? runtimeTelemetry.intervalMs;
+    const effectiveInterval = telemetry.effectiveIntervalMs ?? runtimeTelemetry.effectiveIntervalMs;
     let age = Number.isFinite(session?.ageMs) && session.ageMs >= 0 ? session.ageMs : null;
     if (age === null && Number.isFinite(telemetry.sampledAtMs) && Number.isFinite(now)
         && now >= telemetry.sampledAtMs) age = now - telemetry.sampledAtMs;
@@ -55,6 +57,7 @@
     return {
       mode: ['chain', 'native', 'replay'].includes(mode) ? mode : '—',
       interval: session && Number.isFinite(interval) && interval > 0 ? duration(interval) : '—',
+      effectiveInterval: session && Number.isFinite(effectiveInterval) && effectiveInterval > 0 ? duration(effectiveInterval) : '—',
       seq: Number.isSafeInteger(telemetry.seq) && telemetry.seq >= 0 ? String(telemetry.seq) : '—',
       age: duration(age) + (session?.stale && age !== null ? ' · atrasada' : ''),
       creatures: telemetry.creaturesAvailable === false ? 'Blind · criaturas indisponíveis'
@@ -69,6 +72,7 @@
     const state = telemetryStatus(session, runtime, configured, now);
     for (const [id, value] of Object.entries({
       'sample-mode': state.mode, 'sample-interval': state.interval, 'sample-seq': state.seq,
+      'sample-effective-interval': state.effectiveInterval,
       'sample-age': state.age, 'sample-creatures': state.creatures, 'sample-items': state.items,
       'sample-build-error': state.buildError,
     })) {

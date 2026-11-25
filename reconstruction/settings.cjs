@@ -58,6 +58,12 @@ function migrateTelemetry(config) {
   for (const tab of schema.tabs) {
     if (object(src[tab.key])) candidate[tab.key] = { ...base[tab.key], ...src[tab.key] };
   }
+  const raw = candidate.tools?.telemetry !== undefined ? candidate.tools.telemetry : candidate.telemetry;
+  if (object(raw) && !TELEMETRY_MODES.has(raw.mode)) {
+    const telemetry = { ...raw, mode: TELEMETRY_DEFAULTS.mode };
+    candidate.tools = { ...candidate.tools, telemetry };
+    candidate.telemetry = telemetry;
+  }
   return normalizeTelemetry(candidate);
 }
 function profileName(value) {

@@ -172,7 +172,7 @@
     {
       "path": "index.html",
       "original": "renderer/index.html",
-      "sha256": "bed861efc2353439fe2453b5212f4b4b49987151b27db24c7a400a12eb184084",
+      "sha256": "d800eb53f22cb0c4c0f02c97b683f893779cbafa9ef576b0503bb1be9750eaf2",
       "original_sha256": "1b7f950af832d5ae2deb58b9e3ada2163877931c5afbf5cb57f7d02209701fcc",
       "preserved": true
     },
@@ -249,7 +249,7 @@
     {
       "path": "diagnostics.js",
       "original": "shared/diagnostics.js",
-      "sha256": "a1fd959be576c03d817f6fc428f4b428da0b20eb2c446a17aead5d860a071eb2",
+      "sha256": "b29a74d25e6b0ba817d757cbd793c25350e95dc6d0d9b4516e84ab01ce287d7f",
       "original_sha256": "55e6fecf001a9bbb0b4fda5fb239e876a070906a9c661accd7d3492248435f97",
       "preserved": true
     },
