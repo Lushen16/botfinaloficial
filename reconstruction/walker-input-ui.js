@@ -6,6 +6,9 @@
     if (session?.source === 'rpm' && session.capabilities?.walkerKeyboard === true
         && session.online && !session.stale && session.ageMs >= 0 && session.ageMs <= 1000
         && model.validPosition(session.telemetry?.position)) return { ...session.telemetry.position };
+    if (session?.telemetry?.source === 'chain'
+        && session.online && !session.stale && session.telemetry?.nativeVerified
+        && model.validPosition(session.telemetry?.position)) return { ...session.telemetry.position };
     return nativePosition(session);
   };
 })(typeof window === 'undefined' ? globalThis : window);

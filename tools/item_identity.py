@@ -231,12 +231,14 @@ class ProcessMemory:
                 or not self.kernel.GetProcessTimes(self.handle, *[ctypes.byref(value) for value in times])
                 or not self.kernel.QueryFullProcessImageNameW(self.handle, 0, path, ctypes.byref(length))):
             raise IdentityUnknown('Process/session identity unavailable')
-        if Path(path.value).name.lower() != IMAGE_NAME.lower():
+        lower = Path(path.value).name.lower()
+        if not (lower.startswith('pokealliance') and 'launcher' not in lower):
             raise IdentityUnknown('Wrong process image')
         import pointer_scan_entities as pe
         pe.sc.k32.CloseHandle.argtypes = [wintypes.HANDLE]
         pe.sc.k32.CloseHandle.restype = wintypes.BOOL
-        modules = [module for module in pe.enum_modules(pid) if module['name'].lower() == IMAGE_NAME.lower()]
+        modules = [module for module in pe.enum_modules(pid)
+                   if module['name'].lower().startswith('pokealliance') and 'launcher' not in module['name'].lower()]
         if len(modules) != 1:
             raise IdentityUnknown('Main module unavailable/ambiguous')
         started = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime

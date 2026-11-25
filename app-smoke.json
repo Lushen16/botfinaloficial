@@ -25,7 +25,7 @@
       {
         "name": "Targeting",
         "fields": 29,
-        "text": 1754
+        "text": 1804
       },
       {
         "name": "Healer",
@@ -35,12 +35,12 @@
       {
         "name": "Walker",
         "fields": 17,
-        "text": 1430
+        "text": 1461
       },
       {
         "name": "CAPTURE",
-        "fields": 8,
-        "text": 680
+        "fields": 10,
+        "text": 737
       },
       {
         "name": "Alertas",
@@ -54,8 +54,8 @@
       },
       {
         "name": "Tools",
-        "fields": 14,
-        "text": 909
+        "fields": 20,
+        "text": 1030
       }
     ],
     "profileCreation": true,

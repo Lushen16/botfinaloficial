@@ -7,6 +7,7 @@ const { DEFAULT_GLOBAL_COOLDOWN_MS } = TargetEngine;
 const ATTACK_RETRY_MS = 300;
 const ATTACK_EFFECT_WINDOW_MS = 2000;
 const TARGET_RETRY_DELAY_MS = 4000;
+const MAX_UNCONFIRMED_ATTACKS = 3;
 const SKILL_RETRY_MS = 300;
 /* PokeStop: manda o Pokemon ficar parado na box para os monstros chegarem.
  *
@@ -133,7 +134,7 @@ function createTargetEngine(config, options = {}) {
   const perfectingLureEnabled = combo.perfectingLureEnabled === true || perfectLure;
   const state = {
     targetId: null, attackAt: new Cooldown(), attackDispatched: false, targetSince: null,
-    attackObservation: null, deferredTargets: new Map(),
+    attackObservation: null, deferredTargets: new Map(), attackDeadlines: new Map(), attemptsByTarget: new Map(),
     comboIndex: 0, comboAt: new Cooldown(), comboCompletedAt: null,
     medicineAt: new Cooldown(), medicinePrepared: false, finishing: null,
     pokeStopTries: 0, pokeStopAt: new Cooldown(), comboPokemonName: null, lastSkillCommand: null, rotationKeys: new Set(),
@@ -221,6 +222,7 @@ function createTargetEngine(config, options = {}) {
     state.attackDispatched = false;
     state.attackObservation = null;
     state.deferredTargets.clear();
+    state.attemptsByTarget.clear();
     state.finishing = null;
     restartCombo();
   }
@@ -235,30 +237,39 @@ function createTargetEngine(config, options = {}) {
       return;
     }
     const hp = creature.healthPercent;
+    const unknown = creature.healthUnknown === true && hp === null;
     if (telemetry.creaturesStale === true || !Number.isInteger(telemetry.tick)
         || telemetry.tick <= observation.lastTick
-        || !Number.isFinite(hp) || hp < 0 || hp > 100) return;
-    if (hp < observation.hp) {
+        || (!unknown && (!Number.isFinite(hp) || hp < 0 || hp > 100))) return;
+    if (!unknown && Number.isFinite(observation.hp) && hp < observation.hp) {
+      state.attemptsByTarget.delete(creature.id);
+      state.effectVerified = true;
       state.attackObservation = null;
       return;
     }
-    observation.hp = hp;
+    const comparable = !unknown && Number.isFinite(observation.hp);
+    if (!unknown) observation.hp = hp;
     observation.lastTick = telemetry.tick;
     observation.samples += 1;
-    if (observation.samples >= 2 && now - observation.deliveredAt >= ATTACK_EFFECT_WINDOW_MS) {
+    const windowMs = Number.isFinite(target.damageTimeoutMs) && target.damageTimeoutMs > 0
+      ? target.damageTimeoutMs : ATTACK_EFFECT_WINDOW_MS;
+    const observedRetries = observation.frameCommands && comparable && (state.attemptsByTarget.get(creature.id) ?? 0) >= 2;
+    if (observedRetries || (observation.samples >= (telemetry.creaturesAvailable === true ? 1 : 2) && now - observation.deliveredAt >= windowMs)) {
       state.deferredTargets.set(observation.id, now + TARGET_RETRY_DELAY_MS);
       state.attackObservation = null;
     }
   }
 
-  function recordAttackDelivery(id, telemetry, deliveredAt) {
-    const hp = telemetry.creatures?.find(creature => creature.id === id)?.healthPercent;
+  function recordAttackDelivery(id, telemetry, deliveredAt, frameCommands = false) {
+    const creature = telemetry.creatures?.find(creature => creature.id === id);
+    const hp = creature?.healthPercent;
     if (id !== state.targetId || state.attackObservation?.id === id
         || telemetry.creaturesStale === true || !Number.isInteger(telemetry.tick)
-        || !Number.isFinite(hp) || hp <= 0 || hp > 100) return;
+        || (!(creature?.healthUnknown === true && hp === null) && (!Number.isFinite(hp) || hp <= 0 || hp > 100))) return;
     state.attackObservation = {
-      id, hp, playerId: telemetry.playerId, lastTick: telemetry.tick, deliveredAt, samples: 0,
+      id, hp, playerId: telemetry.playerId, lastTick: telemetry.tick, deliveredAt, samples: 0, frameCommands,
     };
+    state.effectVerified = false;
   }
 
   /**
@@ -347,6 +358,10 @@ function createTargetEngine(config, options = {}) {
   }
 
   function step(telemetry, sink, now, context = {}) {
+    if (telemetry.creaturesAvailable === false) {
+      clearTarget();
+      return { action: 'idle', emitted: [], reason: 'creatures-unavailable', effectVerified: false };
+    }
     tickNow = now;
     if (!Number.isFinite(now)) {
       clearTarget();
@@ -372,6 +387,7 @@ function createTargetEngine(config, options = {}) {
       state.finishing = null;
     }
     // Perfect lure para a rota com os selvagens na tela; sem ele vale o alcance da regra.
+    if (process.env.PKA_TDBG) console.log('TDBG', JSON.stringify({perfectLure, all: all.length, inRange: inRange.length, pool: pool.length, origin, rules, maxDistance: settings.maxDistance, monsters: settings.monsters}));
     const detected = perfectLure ? all.length : pool.length;
 
     if (!pool.length && detected === 0) {
@@ -397,9 +413,12 @@ function createTargetEngine(config, options = {}) {
     }
     observeAttack(telemetry, pool, now);
     for (const [id, retryAt] of state.deferredTargets) {
-      if (now >= retryAt) state.deferredTargets.delete(id);
+      if (now >= retryAt) { state.deferredTargets.delete(id); state.attemptsByTarget.delete(id); }
     }
     const available = state.deferredTargets.size ? pool.filter(candidate => !state.deferredTargets.has(candidate.id)) : pool;
+    if (telemetry.creaturesAvailable === true && pool.length && !available.length) {
+      return { action: 'idle', emitted: [], reason: 'target-cooldown', effectVerified: false };
+    }
     const creature = choose(player, available.length ? available : pool, settings, telemetry?.ownPokemon?.pos);
     if (!creature) {
       clearTarget();
@@ -415,6 +434,7 @@ function createTargetEngine(config, options = {}) {
     const send = (name, parameter, extra) => { sink.command(name, parameter, extra); emitted.push([name, parameter]); };
 
     if (state.targetId !== creature.id) {
+      state.effectVerified = false;
       state.attackObservation = null;
       state.targetId = creature.id;
       restartCombo();
@@ -477,8 +497,24 @@ function createTargetEngine(config, options = {}) {
     }
 
     const needsAttack = context.keyboardTransport !== true || !state.attackDispatched;
-    if (needsAttack && state.attackAt.ready(now, context.keyboardTransport ? ATTACK_RETRY_MS : 1000)) {
-      send('attack', creature.id);
+    for (const [id, deadline] of state.attackDeadlines) if (deadline <= now) state.attackDeadlines.delete(id);
+    const attackDelay = context.frameCommands && Number.isFinite(target.attackCooldownMs) ? Math.max(0, target.attackCooldownMs) : 1000;
+    if (needsAttack && !state.attackDeadlines.has(creature.id) && state.attackAt.ready(now, context.keyboardTransport ? ATTACK_RETRY_MS : attackDelay)) {
+      const limit = Number.isSafeInteger(target.maxAttemptsPerTarget) && target.maxAttemptsPerTarget > 0
+        ? target.maxAttemptsPerTarget : MAX_UNCONFIRMED_ATTACKS;
+      const attempts = state.attemptsByTarget.get(creature.id) ?? 0;
+      if (telemetry.creaturesAvailable === true && attempts >= limit) {
+        if (creature.healthUnknown && state.attackObservation?.id === creature.id) {
+          return { action: 'hold', emitted, targetId: creature.id, reason: 'await-target-hp', effectVerified: false };
+        }
+        state.deferredTargets.set(creature.id, now + TARGET_RETRY_DELAY_MS);
+        state.attackObservation = null;
+        state.effectVerified = false;
+        return { action: 'idle', emitted, reason: 'unconfirmed-attacks', effectVerified: false };
+      }
+      send('attack', creature.id, telemetry.creaturesAvailable === true ? { pos: { ...creature.pos } } : undefined);
+      if (context.frameCommands) state.attackDeadlines.set(creature.id, now + attackDelay);
+      if (telemetry.creaturesAvailable === true) state.attemptsByTarget.set(creature.id, attempts + 1);
       state.attackAt.use(now);
     }
 
@@ -532,7 +568,7 @@ function createTargetEngine(config, options = {}) {
     if (combo.useNativeSequence === true) {
       const nativeHotkey = (typeof combo.nativeHotkey === 'string' && combo.nativeHotkey.trim())
         || (typeof combo.hotkey === 'string' && combo.hotkey.trim());
-      if (nativeHotkey) {
+      if (nativeHotkey && !context.frameCommands) {
         if (context.hotkeysBlocked) return { action: 'combat', emitted, targetId: creature.id, native: true };
         if (state.comboIndex === 0) {
           if (comboReady(now, settings.globalCooldownMs)) {
@@ -553,7 +589,8 @@ function createTargetEngine(config, options = {}) {
 
     /* `sequence` devolve `null` no modo nativo (o jogo executa o combo, o bot
      * nao enumera). Tratar como vazio leva ao ramo de `!autocombo` abaixo. */
-    const steps = sequence(telemetry) || [];
+    const steps = context.frameCommands ? (combo.useNativeSequence === true || combo.sequenceText?.trim() === '!autocombo'
+      ? ['!autocombo'] : parseSequence(combo.sequenceText)) : sequence(telemetry) || [];
 
     /* ─── BEST TILE ANTES DO POKESTOP ───
      *
@@ -660,7 +697,7 @@ function createTargetEngine(config, options = {}) {
     if (!comboReady(now, settings.globalCooldownMs)) return { action: 'combat', emitted, targetId: creature.id };
     const move = steps[state.comboIndex];
     const guard = activeUuid ? { expectedUuid: activeUuid, attackTargetId: creature.id } : undefined;
-    if (!guard && context.keyboardTransport !== true) {
+    if (!guard && context.keyboardTransport !== true && !context.frameCommands) {
       /* Pokemon ausente NO MEIO do combo: o Shiba espera a recuperacao e retoma
        * do MESMO indice, em vez de reiniciar a sequencia.
        *
@@ -707,19 +744,21 @@ function createTargetEngine(config, options = {}) {
           && state.lastSkillCommand.parameter === parameter) state.comboCompletedAt = timestamp;
     },
     inspect(telemetry) {
+      if (telemetry.creaturesAvailable === false) return [];
       const player = { ...telemetry.position, name: telemetry.playerName };
       return candidates(telemetry, player, engineConfig());
     },
     clearTarget,
     restartCombo,
     reset() {
+      state.attackDeadlines.clear();
       engine = new TargetEngine({}, { now: () => tickNow });
       clearTarget();
       Object.assign(state, { targetId: null, attackDispatched: false, comboIndex: 0, comboAt: new Cooldown(),
         healAt: new Cooldown(), lureAt: new Cooldown(), attackAt: new Cooldown(), medicineAt: new Cooldown(),
         finishing: null, blocked: new Set() });
     },
-    get state() { return { targetId: state.targetId, comboIndex: state.comboIndex, comboCompletedAt: state.comboCompletedAt, comboPokemonName: state.comboPokemonName, blocked: [...state.blocked] }; },
+    get state() { return { targetId: state.targetId, effectVerified: state.targetId !== null && state.effectVerified === true, comboIndex: state.comboIndex, comboCompletedAt: state.comboCompletedAt, comboPokemonName: state.comboPokemonName, blocked: [...state.blocked] }; },
   };
 }
 

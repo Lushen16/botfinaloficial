@@ -32,6 +32,7 @@ function normalizeRules(config) {
     huntPokemonNames: String(rule.huntPokemonNames ?? '').split(/[,;\n]/u).map(value => value.trim()).filter(Boolean),
     teleportIntervalMs: Math.max(50, Number.isInteger(rule.teleportIntervalMs) ? rule.teleportIntervalMs : 1000),
     repeat: rule.soundRepeatEnabled === true,
+    cooldownMs: Number.isFinite(rule.cooldownMs) ? Math.max(0, rule.cooldownMs) : 0,
     repeatSeconds: Math.max(1, Number.isInteger(rule.soundRepeatSeconds) ? rule.soundRepeatSeconds : 30),
     pause: {
       walker: rule.pauseWk === true,
@@ -50,6 +51,7 @@ function createAlertsEngine(config) {
   }]));
 
   function notify(entry, now, actions) {
+    if (now - entry.lastNotifyAt < entry.rule.cooldownMs) return;
     entry.lastNotifyAt = now;
     actions.push({ action: 'notify', ruleId: entry.rule.id, type: entry.rule.type });
     for (const [target, enabled] of Object.entries(entry.rule.pause)) {
@@ -96,8 +98,7 @@ function createAlertsEngine(config) {
       }
       if (rule.type === 'disconnected') {
         const online = Boolean(session?.online) && session?.stale !== true && !session?.error && !session?.authExpired;
-        if (entry.wasOnline === null) entry.wasOnline = online;
-        const dropped = entry.wasOnline === true && online === false;
+        const dropped = !online && (entry.wasOnline === true || (entry.wasOnline === null && session?.confirmedOutage === true));
         entry.wasOnline = online;
         if (dropped) notify(entry, now, actions);
         entry.condition = !online;
@@ -105,7 +106,7 @@ function createAlertsEngine(config) {
         continue;
       }
       if (rule.type === 'hp') {
-        const health = Number(telemetry?.healthPercent);
+        const health = telemetry?.healthPercent;
         if (!Number.isFinite(health)) continue;
         const below = health <= rule.hpThreshold;
         if (!below) { entry.phase = 'armed'; entry.condition = false; continue; }
@@ -117,6 +118,7 @@ function createAlertsEngine(config) {
         continue;
       }
       if (rule.type === 'creature') {
+        if (telemetry?.creaturesAvailable === false) continue;
         const matches = creaturesInRange(rule, telemetry).filter(creature => wildcardMatch(rule.creatureName, creature.name));
         const ids = new Set(matches.map(creature => creature.id));
         let fresh = 0;
@@ -129,6 +131,7 @@ function createAlertsEngine(config) {
         continue;
       }
       if (rule.type === 'hunt_pokemon') {
+        if (telemetry?.creaturesAvailable === false) continue;
         const expected = new Set(rule.huntPokemonNames.map(normalizeName));
         const matches = (Array.isArray(telemetry?.creatures) ? telemetry.creatures : []).filter(creature => {
           if (!creature || !isPosition(creature.pos)) return false;

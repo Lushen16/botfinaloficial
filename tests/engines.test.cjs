@@ -40,6 +40,18 @@ function snapshot(telemetry = {}, patch = {}) {
   };
 }
 
+test('explicit creature frames bypass supplemental sources and blind is not zero', () => {
+  const automation = createAutomation(config(), { now: () => 1000, creatureSource: assert.fail });
+  const sink = createRecorder();
+  const unavailable = automation.tick(snapshot({ creaturesAvailable: false, creatures: [creature(8,101,100)] }), sink);
+  assert.equal(unavailable.detected, null);
+  assert.equal(automation.state.creaturesAvailable, false);
+  assert.deepEqual(sink.events, []);
+  const empty = automation.tick(snapshot({ creaturesAvailable: true, creatures: [] }), sink);
+  assert.equal(empty.fight.reason, 'no-creature');
+  assert.equal(automation.state.creaturesAvailable, true);
+});
+
 test('readiness gates block every engine before sending', () => {
   const automation = createAutomation(config(), { now: () => 1000 });
   for (const patch of [{ online: false }, { stale: true }, { error: 'x' }, { authExpired: true },

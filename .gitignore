@@ -69,3 +69,16 @@ native/exec-result.json
 .tmp_*
 *.tmp
 
+
+# Artefatos de sessao / replay (gerados em execucao)
+tmp-session.json
+artifacts/
+
+
+# Material que nao deve ser publicado
+.private-quarantine/
+
+
+# Nome do personagem do operador (dado pessoal)
+native/pka_player_name.txt
+

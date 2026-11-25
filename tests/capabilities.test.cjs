@@ -266,7 +266,10 @@ test('the C declaration lists exactly the same commands as capabilities.cjs', ()
    * teste falha antes de o bug chegar ao jogo. */
   const source = require('node:fs').readFileSync(
     require('node:path').join(__dirname, '..', 'native', 'pka_native.c'), 'utf8');
-  const block = source.match(/#define CAP_COMMANDS ([\s\S]*?)\n\n/);
+  /* CRLF: o arquivo chega do checkout do Windows. Sem o `\r?` o bloco nunca
+   * casa e o teste falha dizendo "CAP_COMMANDS deve existir", escondendo o
+   * motivo real. */
+  const block = source.match(/#define CAP_COMMANDS ([\s\S]*?)\r?\n\r?\n/);
   assert.ok(block, 'CAP_COMMANDS deve existir em pka_native.c');
   const names = [...block[1].matchAll(/\\"([a-zA-Z]+)\\"/g)].map(match => match[1]).sort();
   assert.deepEqual(names, [...capabilities.NATIVE_COMMANDS].sort());

@@ -63,10 +63,26 @@ test('dano no alvo mantem o alvo', () => {
   target.step(t0, recorder, 0);
   target.recordDispatch('attack', 1, 0);
   target.recordAttackDelivery(1, t0, 0);
+  assert.equal(target.state.effectVerified, false);
   target.step(telemetry({ tick: 2, aHp: 80 }), recorder, 500);
+  assert.equal(target.state.effectVerified, true);
   const kept = target.step(telemetry({ tick: 3, aHp: 80 }), recorder, 2500);
   assert.equal(kept.targetId, 1);
   assert.ok(attacks(recorder).every(id => id === 1));
+});
+
+test('observed target carries its tile; three unconfirmed requests then cooldown', () => {
+  const target = engine();
+  const sink = createRecorder();
+  const frame = tick => ({ ...telemetry({ tick, bHp: 0 }), creaturesAvailable: true });
+  for (let tick = 1; tick <= 3; tick++) target.step(frame(tick), sink, tick * 1000);
+  assert.equal(attacks(sink).length, 3);
+  assert.deepEqual(sink.events[0].extra.pos, frame(1).creatures[0].pos);
+  assert.equal(target.step(frame(4), sink, 4000).effectVerified, false);
+  assert.equal(target.step(frame(5), sink, 5000).reason, 'target-cooldown');
+  assert.equal(attacks(sink).length, 3);
+  target.step(frame(6), sink, 8000);
+  assert.equal(attacks(sink).length, 4);
 });
 
 test('o deferimento expira e o alvo volta a ser escolhido', () => {

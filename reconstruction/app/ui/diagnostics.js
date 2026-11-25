@@ -25,3 +25,61 @@
     return [{ action: 'connection', message }, ...issues.filter(issue => issue.action !== 'connection')];
   };
 })(typeof window === 'undefined' ? globalThis : window);
+
+(function(root) {
+  'use strict';
+  const api = typeof module !== 'undefined' && module.exports ? module.exports : root.PkaDiagnostics;
+  const duration = value => Number.isFinite(value) && value >= 0
+    ? value < 1000 ? value + ' ms' : (value / 1000).toLocaleString('pt-BR', { maximumFractionDigits: 1 }) + ' s' : '—';
+
+  function telemetryStatus(session, runtime = {}, configured = {}, now = Date.now()) {
+    runtime = runtime ?? {};
+    configured = configured ?? {};
+    const telemetry = session?.telemetry ?? {};
+    const matchingRuntime = Number.isInteger(session?.pid) && session.pid > 0
+      && Number.isInteger(runtime.pid) && runtime.pid === session.pid;
+    const runtimeTelemetry = matchingRuntime ? runtime.telemetry ?? {} : {};
+    const mode = telemetry.mode ?? telemetry.source ?? runtimeTelemetry.mode;
+    const interval = telemetry.intervalMs ?? runtimeTelemetry.intervalMs ?? configured?.intervalMs;
+    let age = Number.isFinite(session?.ageMs) && session.ageMs >= 0 ? session.ageMs : null;
+    if (age === null && Number.isFinite(telemetry.sampledAtMs) && Number.isFinite(now)
+        && now >= telemetry.sampledAtMs) age = now - telemetry.sampledAtMs;
+    const codes = [
+      session?.reason, session?.blocker?.code, session?.error?.code, session?.telemetryError?.code,
+      matchingRuntime ? runtime.reason : null, matchingRuntime ? runtime.error?.code : null,
+    ].filter(value => typeof value === 'string');
+    const textError = [session?.error, session?.telemetryError, matchingRuntime ? runtime.error : null]
+      .filter(value => typeof value === 'string').join(' ');
+    const buildUnsupported = codes.some(code => /^build-unsupported$/iu.test(code.trim()))
+      || /unsupported[-_ ]build|build[-_ ]not[-_ ]supported|build não suportado|unknown executable identity|executável não suportado/iu.test(textError);
+    return {
+      mode: ['chain', 'native', 'replay'].includes(mode) ? mode : '—',
+      interval: session && Number.isFinite(interval) && interval > 0 ? duration(interval) : '—',
+      seq: Number.isSafeInteger(telemetry.seq) && telemetry.seq >= 0 ? String(telemetry.seq) : '—',
+      age: duration(age) + (session?.stale && age !== null ? ' · atrasada' : ''),
+      creatures: telemetry.creaturesAvailable === false ? 'Blind · criaturas indisponíveis'
+        : telemetry.creaturesAvailable === true ? 'Criaturas observadas' : 'Criaturas: sem informação',
+      blind: telemetry.creaturesAvailable === false,
+      items: telemetry.itemsAvailable === true ? 'Observados' : telemetry.itemsAvailable === false ? 'Indisponíveis' : 'Sem informação',
+      buildError: buildUnsupported ? 'Build não suportado. Este executável não possui um perfil validado nesta versão. Solicite uma atualização compatível.' : '',
+    };
+  }
+
+  function renderTelemetryStatus(document, session, runtime, configured, now) {
+    const state = telemetryStatus(session, runtime, configured, now);
+    for (const [id, value] of Object.entries({
+      'sample-mode': state.mode, 'sample-interval': state.interval, 'sample-seq': state.seq,
+      'sample-age': state.age, 'sample-creatures': state.creatures, 'sample-items': state.items,
+      'sample-build-error': state.buildError,
+    })) {
+      const node = document.getElementById(id);
+      if (node && node.textContent !== value) node.textContent = value;
+    }
+    const badge = document.getElementById('sample-creatures');
+    badge?.classList.toggle('blind', state.blind);
+    const error = document.getElementById('sample-build-error');
+    if (error) error.hidden = !state.buildError;
+    return state;
+  }
+  Object.assign(api, { telemetryStatus, renderTelemetryStatus });
+})(typeof window === 'undefined' ? globalThis : window);

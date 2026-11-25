@@ -4,32 +4,27 @@
     "name": "pka_live_session",
     "version": 1
   },
-  "pid": 10136,
+  "pid": 4512,
   "image": "C:\\Users\\yago\\AppData\\Local\\PokeAlliance Games\\PokeAlliance\\PokeAlliance_dx.exe",
-  "generatedAt": "2026-11-15T00:44:52.754986+00:00",
+  "generatedAt": "2026-11-25T11:00:06.052708+00:00",
   "player": {
-    "name": "Vousabotdenovo",
+    "name": "Piruzinpequeno",
     "pos": {
-      "x": 956,
-      "y": 1404,
-      "z": 6
+      "x": 2988,
+      "y": 2313,
+      "z": 7
     },
-    "hp": 98,
-    "healthPercent": 98,
-    "struct_va": "0x155b15f9a20"
+    "hp": 100,
+    "healthPercent": 100,
+    "struct_va": "0x2aeb0414ea0"
   },
   "creatures": [],
   "live": {
     "source": "cached-va",
     "chains": [
-      "0x392e9c0",
-      "0x392e9b8",
-      "0x392e9f8",
-      "0x392ea00",
-      "0x3938930",
-      "0x3938938"
+      "0x39f8e08"
     ],
-    "module_base": "0x7ff6f4c20000"
+    "module_base": "0x7ff7db5e0000"
   },
   "clientWindowTitle": "PokeAlliance",
   "online": true

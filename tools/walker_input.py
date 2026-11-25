@@ -1,4 +1,4 @@
-"""PID-bound background transport; queued messages never verify game effects."""
+﻿"""PID-bound background transport; queued messages never verify game effects."""
 
 import argparse
 import ctypes
@@ -117,7 +117,6 @@ def window_details(user, hwnd, pid):
 
 
 def find_window(user, pid, callback_type):
-    hwinsta, hdesk = bind_desktop(user)
     windows = []
 
     @callback_type
@@ -137,9 +136,27 @@ def find_window(user, pid, callback_type):
     except OSError:
         pass
 
+    hwinsta, hdesk = bind_desktop(user)
     if not windows and hdesk and hasattr(user, 'EnumDesktopWindows'):
         try:
             user.EnumDesktopWindows(hdesk, visit, 0)
+        except OSError:
+            pass
+
+    if not windows:
+        @callback_type
+        def loose(hwnd, _parameter):
+            owner = wintypes.DWORD()
+            user.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+            if owner.value == pid:
+                try:
+                    title, width, height = window_details(user, hwnd, pid)
+                    windows.append((width * height, hwnd, title))
+                except ValueError:
+                    pass
+            return True
+        try:
+            user.EnumWindows(loose, 0)
         except OSError:
             pass
 
@@ -151,10 +168,28 @@ def find_window(user, pid, callback_type):
     return windows[0][1]
 
 
+DIRECTION_KEYS = {
+    0: ((0x26, 0x48),),
+    1: ((0x27, 0x4D),),
+    2: ((0x28, 0x50),),
+    3: ((0x25, 0x4B),),
+    4: ((0x26, 0x48), (0x27, 0x4D)),
+    5: ((0x27, 0x4D), (0x28, 0x50)),
+    6: ((0x28, 0x50), (0x25, 0x4B)),
+    7: ((0x25, 0x4B), (0x26, 0x48)),
+}
+
+
 def movement_scan(direction):
     if type(direction) is not int or direction not in range(4):
         raise ValueError('Walker teclado aceita somente setas cardinais.')
     return (0x48, 0x4D, 0x50, 0x4B)[direction], True
+
+
+def movement_keys(direction):
+    if type(direction) is not int or direction not in DIRECTION_KEYS:
+        raise ValueError('Walker teclado aceita direcoes 0..7.')
+    return DIRECTION_KEYS[direction], True
 
 
 def key_messages(vk, scan, extended=False):
@@ -179,16 +214,114 @@ def post_checked(user, hwnd, message, result, counter):
 
 
 def send_tap(user, hwnd, messages, result, pointer=None, validate=None):
+    keys = messages if isinstance(messages, list) and messages and isinstance(messages[0], list) else [messages]
     try:
         if validate is not None:
             validate()
         if pointer is not None:
             post_checked(user, hwnd, pointer, result, 'pointerEventsSent')
-        post_checked(user, hwnd, messages[0], result, 'eventsSent')
+        for down, _up in keys:
+            post_checked(user, hwnd, down, result, 'eventsSent')
         try:
             time.sleep(0.04)
         finally:
-            post_checked(user, hwnd, messages[1], result, 'eventsSent')
+            for _down, up in reversed(keys):
+                post_checked(user, hwnd, up, result, 'eventsSent')
+    except Exception as error:
+        result.update(success=False, error=str(error), errorCode='INPUT_DISPATCH_FAILED', retrySafe=False)
+        raise DispatchError(str(error), result) from error
+    result['queuedAtMs'] = time.time_ns() // 1000000
+    return result
+
+
+def click_client(user, hwnd, x, y, result, validate=None):
+    """Clique esquerdo em coordenada de CLIENTE (nao de tela).
+
+    WM_LBUTTONDOWN/UP com lParam = x | (y << 16), valido dentro de
+    GetClientRect. Verifica HWND/PID antes e depois, como as teclas.
+    """
+    rect = wintypes.RECT()
+    if not user.GetClientRect(hwnd, ctypes.byref(rect)):
+        raise ValueError('GetClientRect falhou.')
+    largura = rect.right - rect.left
+    altura = rect.bottom - rect.top
+    if not (0 <= x < largura and 0 <= y < altura):
+        raise ValueError('Coordenada de cliente fora da janela (%dx%d).' % (largura, altura))
+    lparam = (int(y) << 16) | (int(x) & 0xFFFF)
+    try:
+        if validate is not None:
+            validate()
+        post_checked(user, hwnd, (0x0200, 0, lparam), result, 'pointerEventsSent')   # WM_MOUSEMOVE
+        time.sleep(0.02)
+        post_checked(user, hwnd, (0x0201, 0x0001, lparam), result, 'pointerEventsSent')  # LBUTTONDOWN
+        time.sleep(0.04)
+        post_checked(user, hwnd, (0x0202, 0, lparam), result, 'pointerEventsSent')    # LBUTTONUP
+    except Exception as error:
+        result.update(success=False, error=str(error), errorCode='INPUT_DISPATCH_FAILED', retrySafe=False)
+        raise DispatchError(str(error), result) from error
+    result['queuedAtMs'] = time.time_ns() // 1000000
+    return result
+
+
+def type_text(user, hwnd, text, result, validate=None):
+    """Abre o chat com Tab, digita por WM_CHAR e confirma com Enter."""
+    if not isinstance(text, str) or not text or len(text) > 200:
+        raise ValueError('texto invalido (1..200 caracteres).')
+    try:
+        if validate is not None:
+            validate()
+        post_checked(user, hwnd, key_messages(0x09, 0x0F)[0], result, 'eventsSent')     # Tab
+        time.sleep(0.15)
+        for ch in text:
+            post_checked(user, hwnd, (0x0102, ord(ch), 1), result, 'eventsSent')       # WM_CHAR
+            time.sleep(0.008)
+        post_checked(user, hwnd, key_messages(0x0D, 0x1C)[0], result, 'eventsSent')   # Enter
+    except Exception as error:
+        result.update(success=False, error=str(error), errorCode='INPUT_DISPATCH_FAILED', retrySafe=False)
+        raise DispatchError(str(error), result) from error
+    result['queuedAtMs'] = time.time_ns() // 1000000
+    return result
+
+
+def press_hotkey(user, hwnd, spec, result, validate=None):
+    """Hotkey tipo 'F8', 'Ctrl+F8', '1'. Usa WM_KEYDOWN/UP via MapVirtualKeyW."""
+    if not isinstance(spec, str) or not spec.strip():
+        raise ValueError('hotkey vazia.')
+    partes = [p.strip() for p in spec.split('+') if p.strip()]
+    if not partes or len(partes) > 3:
+        raise ValueError('hotkey invalida.')
+    MODS = {'ctrl': (0x11, 0x1D), 'alt': (0x12, 0x38), 'shift': (0x10, 0x2A)}
+    NOMES = {'F1': 0x70, 'F2': 0x71, 'F3': 0x72, 'F4': 0x73, 'F5': 0x74, 'F6': 0x75,
+             'F7': 0x76, 'F8': 0x77, 'F9': 0x78, 'F10': 0x79, 'F11': 0x7A, 'F12': 0x7B,
+             'TAB': 0x09, 'ENTER': 0x0D, 'SPACE': 0x20, 'ESC': 0x1B}
+    modificadores = []
+    tecla = None
+    for parte in partes:
+        baixo = parte.lower()
+        if baixo in MODS:
+            modificadores.append(MODS[baixo])
+        else:
+            if baixo in (k.lower() for k in NOMES):
+                tecla = next(v for k, v in NOMES.items() if k.lower() == baixo)
+                scan = user.MapVirtualKeyW(tecla, 0)
+            elif len(parte) == 1:
+                tecla = user.VkKeyScanW(ctypes.c_wchar(parte)) & 0xFF if hasattr(user, 'VkKeyScanW') else ord(parte.upper())
+                scan = user.MapVirtualKeyW(tecla, 0)
+            else:
+                raise ValueError('tecla desconhecida: ' + parte)
+    if tecla is None:
+        raise ValueError('hotkey sem tecla final.')
+    try:
+        if validate is not None:
+            validate()
+        for vk, sc in modificadores:
+            post_checked(user, hwnd, (0x0100, vk, 1 | (sc << 16)), result, 'eventsSent')
+            time.sleep(0.01)
+        post_checked(user, hwnd, (0x0100, tecla, 1 | (scan << 16)), result, 'eventsSent')
+        time.sleep(0.03)
+        post_checked(user, hwnd, (0x0101, tecla, (1 | (scan << 16)) | 0xC0000000), result, 'eventsSent')
+        for vk, sc in reversed(modificadores):
+            post_checked(user, hwnd, (0x0101, vk, (1 | (sc << 16)) | 0xC0000000), result, 'eventsSent')
     except Exception as error:
         result.update(success=False, error=str(error), errorCode='INPUT_DISPATCH_FAILED', retrySafe=False)
         raise DispatchError(str(error), result) from error
@@ -200,9 +333,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--pid', type=int, required=True)
     operation = parser.add_mutually_exclusive_group(required=True)
-    operation.add_argument('--direction', type=int, choices=range(4))
+    operation.add_argument('--direction', type=int, choices=range(8))
     operation.add_argument('--probe', action='store_true')
     operation.add_argument('--focus', action='store_true')
+    operation.add_argument('--click', nargs=2, type=int, metavar=('X', 'Y'))
+    operation.add_argument('--talk')
+    operation.add_argument('--potion')
     args = parser.parse_args()
     result = {'success': False, 'pid': args.pid, 'eventsSent': 0, 'pointerEventsSent': 0,
               'transport': 'PostMessageW', 'effectVerified': False, 'retrySafe': False}
@@ -218,13 +354,34 @@ def main():
         result.update(hwnd=hex(hwnd), title=title, width=width, height=height,
                       foreground=user.GetForegroundWindow() == hwnd)
         if args.direction is not None:
-            scan, extended = movement_scan(args.direction)
-            messages = key_messages((0x26, 0x27, 0x28, 0x25)[args.direction], scan, extended)
+            pairs, extended = movement_keys(args.direction)
+            messages = [key_messages(vk, scan, extended) for vk, scan in pairs]
             def validate():
                 if window_details(user, hwnd, args.pid) != (title, width, height):
                     raise ValueError('Janela mudou antes do envio.')
             result['startedAtMs'] = time.time_ns() // 1000000
             send_tap(user, hwnd, messages, result, validate=validate)
+        elif args.click is not None:
+            def validate():
+                if window_details(user, hwnd, args.pid) != (title, width, height):
+                    raise ValueError('Janela mudou antes do envio.')
+            result['startedAtMs'] = time.time_ns() // 1000000
+            result['click'] = {'x': args.click[0], 'y': args.click[1]}
+            click_client(user, hwnd, args.click[0], args.click[1], result, validate=validate)
+        elif args.talk is not None:
+            def validate():
+                if window_details(user, hwnd, args.pid) != (title, width, height):
+                    raise ValueError('Janela mudou antes do envio.')
+            result['startedAtMs'] = time.time_ns() // 1000000
+            result['talk'] = args.talk
+            type_text(user, hwnd, args.talk, result, validate=validate)
+        elif args.potion is not None:
+            def validate():
+                if window_details(user, hwnd, args.pid) != (title, width, height):
+                    raise ValueError('Janela mudou antes do envio.')
+            result['startedAtMs'] = time.time_ns() // 1000000
+            result['potion'] = args.potion
+            press_hotkey(user, hwnd, args.potion, result, validate=validate)
         result['success'] = True
     except Exception as error:
         result.update(success=False, error=str(error), uncertain=result['eventsSent'] > 0 or result['pointerEventsSent'] > 0)
@@ -235,3 +392,5 @@ if __name__ == '__main__':
     outcome = main()
     print(json.dumps(outcome))
     raise SystemExit(0 if outcome['success'] else 1)
+
+

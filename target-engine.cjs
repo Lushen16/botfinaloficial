@@ -42,8 +42,9 @@ function targetRules(config) {
 
 function candidateScore(player, creature, rules, maxDistance) {
   if (!creature || !validId(creature.id) || !validPosition(creature.pos)
-      || creature.pos.z !== player.z || !Number.isFinite(creature.healthPercent)
-      || creature.healthPercent <= 0 || creature.healthPercent > 100
+      || creature.pos.z !== player.z
+      || (!(creature.healthUnknown === true && creature.healthPercent === null)
+        && (!Number.isFinite(creature.healthPercent) || creature.healthPercent <= 0 || creature.healthPercent > 100))
       || creature.is_player === true || creature.canAttack === false
       || creature.is_owned === true || creature.isOwnPokemon === true
       || (creature.creatureType !== undefined && creature.creatureType !== 1)) return null;
@@ -122,7 +123,7 @@ class TargetEngine {
 
   _isBetter(candidate, current, mode) {
     if (mode === 'lowestHp' && candidate.creature.healthPercent !== current.creature.healthPercent) {
-      return candidate.creature.healthPercent < current.creature.healthPercent;
+      return (candidate.creature.healthPercent ?? Infinity) < (current.creature.healthPercent ?? Infinity);
     }
     if (mode === 'highestPriorityList' && candidate.priority !== current.priority) {
       return candidate.priority < current.priority;
@@ -189,6 +190,7 @@ class TargetEngine {
 
   _matchesHealth(skill) {
     const health = this._target.healthPercent;
+    if (!Number.isFinite(health) && (skill.onlyIfHpAbove !== undefined || skill.onlyIfHpBelow !== undefined)) return false;
     for (const field of ['onlyIfHpAbove', 'onlyIfHpBelow']) {
       const threshold = skill[field];
       if (threshold !== undefined

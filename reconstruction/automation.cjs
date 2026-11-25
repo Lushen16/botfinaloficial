@@ -8,6 +8,7 @@ const { createLureEngine, normalizeLuring } = require('./engines/lure-engine.cjs
 const { createConsumablesEngine } = require('./engines/consumables-engine.cjs');
 const { encodeCommand } = require('./protocol.cjs');
 const { mergeCreatureSnapshot } = require('../tools/creature_bridge.cjs');
+const { createFrameAutomation } = require('./engines/frame-automation.cjs');
 
 /* Tentativas de revive por combo (1 envio + 1 retry). */
 
@@ -18,7 +19,10 @@ function gateReason(snapshot) {
   if (session.stale) return 'stale';
   if (session.error) return 'error';
   if (session.authExpired) return 'auth-expired';
-  if (Number(session.ageMs) > 1000) return 'stale-snapshot';
+  const maxAgeMs = session.telemetry?.source === 'chain'
+    ? Math.max(1000, Number(session.telemetry.intervalMs || 5000) * 2 + 1000)
+    : 1000;
+  if (Number(session.ageMs) > maxAgeMs) return 'stale-snapshot';
   const telemetry = session.telemetry;
   if (!telemetry) return 'no-telemetry';
   if (telemetry.nativeVerified !== true) return 'native-unverified';
@@ -266,15 +270,22 @@ function createAutomation(config, options = {}) {
       return blocked('invalid-clock');
     }
     try {
-      const scan = typeof options.creatureSource === 'function'
-        ? options.creatureSource(snapshot) : snapshot.creatureSnapshot;
-      if (scan !== undefined || typeof options.creatureSource === 'function') {
+      /* `creaturesAvailable` booleano e' contrato explicito: o adapter e' a
+       * fonte de verdade e nenhuma fonte suplementar pode ser consultada.
+       * Sem esta guarda, `creatureSource` era chamado mesmo com o frame
+       * dizendo "eu ja' sei", e o teste de contrato acusava. */
+      const scan = typeof snapshot.telemetry.creaturesAvailable === 'boolean' ? undefined
+        : typeof options.creatureSource === 'function'
+          ? options.creatureSource(snapshot) : snapshot.creatureSnapshot;
+      if (typeof snapshot.telemetry.creaturesAvailable !== 'boolean'
+          && (scan !== undefined || typeof options.creatureSource === 'function')) {
         snapshot = mergeCreatureSnapshot(snapshot, scan, now, options.creatureMaxAgeMs ?? 1000);
       }
     } catch (error) {
       return blocked('creature-snapshot', error.message);
     }
     const telemetry = snapshot.telemetry;
+    state.creaturesAvailable = telemetry.creaturesAvailable ?? null;
     const hotkeysBlocked = (state.lastHotkeyAt !== null && now - state.lastHotkeyAt < 250)
       || options.hotkeysBlocked?.() === true;
     const output = { command(name, parameter, extra) {
@@ -283,6 +294,17 @@ function createAutomation(config, options = {}) {
       return result;
     } };
     state.ticks += 1;
+    /* Sem lista de criaturas o combate fica cego: nao da' para escolher alvo,
+     * entao o walker assume e `detected` e' `null` (desconhecido), nunca 0 —
+     * zero significaria "olhei e nao havia nenhuma". */
+    if (telemetry.creaturesAvailable === false) {
+      target.clearTarget();
+      const walk = enabled('walker') ? walker.step({ ...telemetry, creatures: [], wildCount: null }, output, now)
+        : { action: 'disabled', emitted: [] };
+      state.last = { status: enabled('walker') ? 'walking' : 'idle', walk, emitted: walk.emitted,
+        blocked: [], detected: null, creaturesAvailable: false, reason: 'creatures-unavailable' };
+      return state.last;
+    }
     /* Consumíveis antes de cura/combate: são agendados por tempo e um hotkey
      * por tick. Se um venceu, ele ocupa o tick. */
     const consumable = consumables.step(now, output);
@@ -354,9 +376,59 @@ function createAutomation(config, options = {}) {
       walker.reset(); target.reset(); healer.reset(); lure.reset(); consumables.reset();
       state.ticks = 0; state.last = null; state.lastHotkeyAt = null; state.recovering = false; state.revive = null; state.reviveHandledAt = null;
     },
-    get state() { return { ticks: state.ticks, walker: walker.state, target: target.state, healer: healer.state, lure: lure.state, consumables: consumables.state, revive: state.revive }; },
+    walker,
+    get state() { return { ticks: state.ticks, creaturesAvailable: state.creaturesAvailable ?? null,
+      walker: walker.state, target: target.state, healer: healer.state, lure: lure.state,
+      consumables: consumables.state, revive: state.revive }; },
     get last() { return state.last; },
   };
 }
 
-module.exports = { createAutomation, createRecorder, createProtocolSink, gateReason };
+/* Replay de uma sequencia de frames pelo frame-automation.
+ *
+ * Caminho paralelo ao `tick` de producao: aqui o walker e' descartavel e o
+ * chamador nao despacha nada — serve para exercitar a decisao sem adapter.
+ * Recriado apos a remocao acidental; `EngineRuntime.replay` e os testes de
+ * contrato (frame_runtime_replay, blind_offline_contract) dependem dele.
+ */
+function replayFrameSequence(config, samples) {
+  if (!Array.isArray(samples)) throw TypeError('Expected an array of timestamped snapshots');
+  const automation = createFrameAutomation(config);
+  const walker = createWalkerEngine(config);
+  let boxWalker = null, box = null;
+  return samples.map(({ snapshot, now }) => {
+    const decision = automation.tick(snapshot, now);
+    if (decision.phase === 'session-changed') walker.reset();
+    if (decision.phase !== 'force-box' && decision.phase !== 'await-frame') { boxWalker = null; box = null; }
+    if (!decision.allowMovement) {
+      if (decision.phase !== 'await-frame') walker.notifySkipped();
+    } else {
+      const raw = snapshot.telemetry;
+      let activeWalker = walker;
+      if (decision.phase === 'force-box') {
+        walker.notifySkipped();
+        if (box !== decision.waypoint) {
+          box = decision.waypoint;
+          boxWalker = createWalkerEngine({ walker: { ...config.walker, loop: false, waypoints: [box] } });
+        }
+        activeWalker = boxWalker;
+      }
+      decision.walk = activeWalker.step({ ...raw, position: raw.player?.pos ?? raw.position,
+        playerId: raw.player?.id, tick: raw.seq ?? raw.tick }, {
+        command(name, parameter) { decision.orders.push({ name, parameter }); },
+      }, now);
+    }
+    decision.orders = decision.orders.map(order => {
+      if (order.name === 'attack') return { name: 'attack', parameter: { pos: order.parameter } };
+      if (order.name !== 'capture') return order;
+      return { name: 'capture', parameter: {
+        x: order.parameter.pos.x, y: order.parameter.pos.y, ball: order.parameter.ballKey ?? order.parameter.ballSlot,
+      } };
+    });
+    return decision;
+  });
+}
+
+module.exports = { createAutomation, createRecorder, createProtocolSink, gateReason,
+  createFrameAutomation, replayFrameSequence };
+module.exports.createBlindReplay = require('./telemetry/walker-replay.cjs').createWalkerReplay;

@@ -250,8 +250,10 @@ def locate_player(handle, pid, player_name, layout, filters):
     import pka_live_session as live
     if not isinstance(player_name, str) or not player_name.strip():
         raise ValueError('player name is required')
-    module = next(module for module in pe.enum_modules(pid)
-                  if module['name'].lower() == IMAGE_NAME.lower())
+    def _is_client(module):
+        name = module['name'].lower()
+        return name.startswith('pokealliance') and name.endswith('.exe') and 'launcher' not in name
+    module = next(module for module in pe.enum_modules(pid) if _is_client(module))
     candidate = live.resolve_chains(lambda address, size: read_mem(handle, address, size),
         module['base'], live.DEFAULT_CHAINS, layout, filters, player_name)
     if candidate:
@@ -297,12 +299,7 @@ def identity_profile(handle, pid, creature_vtable, player_vtable):
         module = next(m for m in pe.enum_modules(pid) if m["name"].lower() == IMAGE_NAME.lower())
     except Exception:
         pass
-    sha = None
-    try:
-        path = process_image_path(handle)
-        sha = file_sha256(path) if path else None
-    except OSError:
-        sha = None
+    sha = process_sha256(handle)
     return {
         "executableSha256": sha,
         "typeOffset": hex(Layout.type_offset),
@@ -334,11 +331,11 @@ def resolve_stream_profile(handle, pid, player_vtable):
     import otclient_rtti as rtti
 
     module = next(module for module in pe.enum_modules(pid)
-                  if module["name"].lower() == IMAGE_NAME.lower())
+                  if module["name"].lower().startswith('pokealliance')
+                  and 'launcher' not in module["name"].lower())
     profile = identity_profile(handle, pid, None, player_vtable)
-    allowed_hashes = getattr(identity, "SUPPORTED_EXECUTABLE_SHA256", {identity.EXECUTABLE_SHA256})
-    if profile["executableSha256"] not in allowed_hashes:
-        raise ValueError("Unsupported creature executable identity")
+    profile['layout'] = identity.verified_layout(profile['executableSha256'])
+    profile['typeOffset'] = hex(profile['layout']['type'])
     image = rtti.read_module_image(handle, module["base"], module["size"])
     control = rtti.resolve_class(image, module["base"], "?$_Ref_count_obj2@VMonster@@@std")
     monster = rtti.resolve_class(image, module["base"], "Monster")
@@ -352,11 +349,19 @@ def resolve_stream_profile(handle, pid, player_vtable):
 def stream_snapshot(handle, pid, player_name, output, interval_ms=300, rescan_ms=8000):
     import threading
     import otclient_rtti as rtti
-    layout, filters = Layout(), Filters()
-    try:
-        player = locate_player(handle, pid, player_name, layout, filters)
-    except ValueError as error:
-        print(json.dumps({'error': str(error), 'pid': pid}), file=sys.stderr, flush=True)
+    filters = Filters()
+    player = None
+    # Builds >= 2026-11-09 usam layout shifted -0x10. Tentar esse primeiro
+    # evita a varredura longa com offsets errados; o default fica de fallback.
+    for layout in (Layout(0x20, 0x4C, 0x70, 0xB0, 0xB4, 0x176), Layout()):
+        try:
+            player = locate_player(handle, pid, player_name, layout, filters)
+            break
+        except ValueError:
+            continue
+    if player is None:
+        print(json.dumps({'error': 'player not found or identity invalid', 'pid': pid}),
+              file=sys.stderr, flush=True)
         return 2
     player_va = int(player['struct_va'], 16)
     profile = resolve_stream_profile(handle, pid, int(player['vtable'], 16))

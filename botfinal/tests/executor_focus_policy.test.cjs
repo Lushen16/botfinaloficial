@@ -133,14 +133,19 @@ test('require_foreground so le o foregroud, nao altera', () => {
   }
 });
 
-test('walk exige foco; hotkey posta sem foco (medido 2026-11-13)', () => {
+test('walk e hotkey postam sem foco (medido 2026-11-20)', () => {
   const code = stripComments(fs.readFileSync(SOURCE, 'utf8'));
   const walk = code.slice(code.indexOf('if (type == 1)'),
     code.indexOf('if (type == 20)'));
+  /* 2026-11-13 o foco era exigido. Medido de novo em 2026-11-20 com o jogo
+   * MINIMIZADO: 3 de 3 passos entregues por PostMessageA. O gate virou log. */
   assert.match(walk, /require_foreground\(hwnd\)/u,
-    'o caminho de walk precisa exigir foreground');
-  assert.match(walk, /STATUS_NO_FOREGROUND/u,
-    'walk precisa devolver status 5 quando nao ha foco');
+    'o caminho de walk continua registrando o estado de foco');
+  assert.match(walk, /EM SEGUNDO PLANO/u,
+    'o log precisa registrar que a tecla saiu em segundo plano');
+  assert.match(walk, /tap_key_ex/u, 'walk precisa postar a seta');
+  assert.ok(!/return STATUS_NO_FOREGROUND/u.test(walk),
+    'walk nao pode mais recusar por falta de foco');
 
   /* HOTKEY: o contrato ANTIGO exigia require_foreground e devolvia 5 sempre
    * que o jogo estava atras. Medido em 2026-11-13: `tap_key_with_mods` usa

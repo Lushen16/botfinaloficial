@@ -40,8 +40,7 @@ import pointer_scan_entities as pe
 
 DEFAULT_CHAIN_RVA = 0x392E9C0
 DEFAULT_CHAINS = (
-    (0x392E9C0, ()), (0x392E9B8, (0x10,)), (0x392E9F8, (0x1A8,)),
-    (0x392EA00, (0x1B8,)), (0x3938930, (0x110,)), (0x3938938, (0x120,)),
+    (0x39F8E08, ()),
 )
 PLAYER_ID_MIN, PLAYER_ID_MAX = 0x10000000, 0x10010000
 MONSTER_ID_MIN, MONSTER_ID_MAX = 0x40000000, 0x40100000
@@ -104,6 +103,26 @@ def in_id_family(ident) -> bool:
         PLAYER_ID_MIN <= ident < PLAYER_ID_MAX or MONSTER_ID_MIN <= ident < MONSTER_ID_MAX or CREATURE_ID_MIN <= ident < CREATURE_ID_MAX)
 
 
+def _resolve_name_field(read, raw, layout, filters):
+    """Names up to 15 bytes live inline (SSO); longer ones are a heap pointer."""
+    inline = raw.split(b"\x00", 1)[0]
+    if sc.plausible_name(inline, filters):
+        return inline
+    if len(raw) < 16:
+        return None
+    pointer = struct.unpack_from("<Q", raw, 0)[0]
+    if pointer < 0x10000 or pointer > 0x7FFFFFFFFFFF:
+        return None
+    length = struct.unpack_from("<Q", raw, 8)[0]
+    if not 0 < length <= layout.name_max:
+        length = layout.name_max
+    heap = read(pointer, int(length) + 1)
+    if not heap:
+        return None
+    heap = heap.split(b"\x00", 1)[0]
+    return heap if sc.plausible_name(heap, filters) else None
+
+
 def read_entity(read, va, layout, filters):
     """Read one creature struct (name + position). Returns None if implausible."""
     if not va:
@@ -112,8 +131,8 @@ def read_entity(read, va, layout, filters):
     position = read(va + layout.pos_offset, 10)
     if not name or not position or len(position) < 10:
         return None
-    name = name.split(b"\x00", 1)[0]
-    if not sc.plausible_name(name, filters):
+    name = _resolve_name_field(read, name, layout, filters)
+    if name is None:
         return None
     x, y, z = struct.unpack("<iih", position)
     if not sc.plausible_coords(x, y, z, filters):
@@ -214,7 +233,7 @@ def main(argv=None) -> int:
     parser.add_argument("--player-name", default=None, help="expected local player name")
     parser.add_argument("--chain-rva", type=lambda t: int(t, 0), default=None,
                         help="override the default chain set with a single direct chain rva")
-    parser.add_argument("--id-offset", type=lambda t: int(t, 0), default=0x5C)
+    parser.add_argument("--id-offset", type=lambda t: int(t, 0), default=0x4C)
     parser.add_argument("--hp-offset", type=lambda t: int(t, 0), default=0xC0)
     parser.add_argument("--output", type=Path, default=Path("live-snapshot-27964.json"))
     parser.add_argument("--interval-ms", type=int, default=250)
@@ -227,6 +246,7 @@ def main(argv=None) -> int:
     parser.add_argument("--watch", action="store_true", help="run continuously (default unless --once)")
     parser.add_argument("--selftest", action="store_true")
     parser.add_argument("--probe-access", action="store_true", help="check RPM access without scanning or sending inputs")
+    parser.add_argument("--no-scan", action="store_true", help="abort instead of falling back to full-memory scan")
     args = parser.parse_args(argv)
 
     if args.selftest:
@@ -245,7 +265,9 @@ def main(argv=None) -> int:
         print(json.dumps({'ok': True, 'pid': target_pid, 'rpmAccess': True, 'commandsSent': 0}), flush=True)
         return 0
 
-    layout, filters = sc.Layout(), sc.Filters()
+    # build 2026-11-20: layout shifted -0x10 (pos 0x20). Default antigo
+    # lia lixo (pos 35,8) e o runtime pausava.
+    layout, filters = sc.Layout(0x20, 0x4C, 0x70, 0xB0, 0xB4, 0x176), sc.Filters()
     chains = DEFAULT_CHAINS if args.chain_rva is None else ((args.chain_rva, ()),)
     handle = pid = image = module_base = None
     module_at = 0.0
@@ -335,6 +357,10 @@ def main(argv=None) -> int:
                 player, source = candidate, "pointer-chain"
                 cached_va = int(candidate["struct_va"], 16)
         if player is None and now - last_relocate >= args.relocate_min_interval_s:
+            if args.no_scan:
+                print(json.dumps({"ok": False, "pid": pid, "error": "relocate-scan-disabled",
+                                  "module_base": hex(module_base) if module_base else None}), flush=True)
+                return 4
             last_relocate = now
             name_to_find = expected or args.player_name
             if not name_to_find and pid:
@@ -345,7 +371,7 @@ def main(argv=None) -> int:
                         expected = name_to_find = candidate_name
             if name_to_find:
                 va = pe.locate_by_name(handle, name_to_find, layout, filters,
-                                       args.id_offset, None)
+                                       layout.id_offset, None)
                 if va:
                     cached_va = va
                     candidate = read_entity(read, va, layout, filters)

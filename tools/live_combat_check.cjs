@@ -13,7 +13,7 @@ async function main() {
   const name = process.argv[3];
   const durationOption = process.argv.find(value => value.startsWith('--duration-ms='));
   const durationMs = durationOption ? Number(durationOption.split('=')[1]) : 3500;
-  if (!Number.isInteger(durationMs) || durationMs < 1000 || durationMs > 10000) throw Error('Duracao deve estar entre 1000 e 10000ms.');
+  if (!Number.isInteger(durationMs) || durationMs < 1000 || durationMs > 900000) throw Error('Duracao deve estar entre 1000 e 900000ms.');
   if (!Number.isInteger(pid) || pid <= 0 || !name) throw Error('Uso: node tools/live_combat_check.cjs PID PLAYER');
   const root = path.resolve(__dirname, '..');
   const directory = path.join(root, 'captures', 'combat-live-' + pid + '-' + new Date().toISOString().replace(/[:.]/g, '-'));
@@ -70,6 +70,12 @@ async function main() {
         await new Promise(resolve => setTimeout(resolve, 100));
       }
       if (!accepted) throw Error('Validacao cancelada: foco nao confirmado em 60s.');
+    }
+    if (process.argv.includes('--engage-any')) {
+      config.target.monsters = (Array.isArray(config.target.monsters) && config.target.monsters.length
+        ? config.target.monsters : [{ name: '*', range: 12, priority: 1, minCount: 1 }])
+        .map(row => ({ ...row, minCount: 1 }));
+      log({ engageAny: true });
     }
     if (process.argv.includes('--single-target')) {
       config.hoenn.perfectLure = false;

@@ -15,6 +15,9 @@ Data: 2026-11-16.
 > LocalPlayer `0x39F8E08`, TEXT_CTX/GATE/REENTRY `0x39F8E48/0x39F8F48/0x39F8F4A`,
 > vtable do player `0x1FDB2A8`). Build e preflight verdes em 19/11; evidência e
 > método em `docs/MISSOES/vereditos/00-sessao-2026-11-19.md`.
+ > Sem foco: em 20/11 o jogo minimizado andou 3/3 passos, attack rc=11 e combo
+ > status 0 por PostMessage — gate de foco removido de `walk` e do chat.
+>
 > Achados abertos: walker encerra `walk` a 1 tile (`arrived-within-one-tile`) e o
 > `live_walk_channel` aprova assim; `recallPokemon` é recusado (`status 1`);
 > o pulso publica `"roster":[]`, `"items":[]` e `"tiles":[]` fixos.

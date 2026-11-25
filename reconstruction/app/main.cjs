@@ -4,18 +4,33 @@ const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 const { spawn } = require('node:child_process');
 const { createInterface } = require('node:readline');
-const { discoverProcesses, providerOptions, useKeyboardWalker } = require('../live-client.cjs');
+const { discoverProcesses, selectPid, providerOptions, useKeyboardWalker } = require('../live-client.cjs');
 const { Controller, nativeUnavailable } = require('../controller.cjs');
 const { EngineRuntime } = require('../engine-runtime.cjs');
 const { RpmCombatRuntime } = require('../rpm-combat-runtime.cjs');
 const { rpmSession } = require('../live-session.cjs');
 const nativeAdapter = require('../native-adapter.cjs');
+const chainAdapter = require('../telemetry/chain-adapter.cjs');
+const replayAdapter = require('../telemetry/replay-adapter.cjs');
+const { ensureChannel } = require('../channel-bootstrap.cjs');
 const { createSimulation } = require('../local-runtime.cjs');
 const { createMonitorRuntime } = require('../monitor-runtime.cjs');
 const { createRouteStore, loadWalkerProfile } = require('../route-store.cjs');
 const { createCreatureSource } = require('../../tools/creature_bridge.cjs');
 const { createItemSource } = require('../item-source.cjs');
-const { SettingsStore, validateConfig, MAX_BYTES } = require('../settings.cjs');
+const { SettingsStore, validateConfig, normalizeTelemetry, migrateTelemetry, MAX_BYTES } = require('../settings.cjs');
+const { verifyExecutableForPid } = require('../executable-identity.cjs');
+const { chainRvaFor } = require('../executable-profile.cjs');
+const {
+  shouldSpawnLegacy,
+  killTree,
+  createTracker,
+  reapStale,
+  inspectReaderDescendants,
+  inspectPythonDescendants,
+  validateGameProcessPid,
+  bootProviders,
+} = require('./provider-guard.cjs');
 const os = require('node:os');
 const { OtmmReader } = require('../otmm.cjs');
 const root = path.resolve(__dirname, '../..');
@@ -23,6 +38,12 @@ require(path.join(root, 'extracted_v3.3.1/bytecode-runtime.cjs'));
 const configSharing = require(path.join(root, 'extracted_v3.3.1/lib/config-sharing.jsc'));
 const smoke = process.argv.includes('--smoke');
 const audit = process.argv.includes('--audit');
+const hasSingleInstanceLock = (smoke || audit || process.env.PKA_ALLOW_MULTI_INSTANCE === '1')
+  ? true
+  : app.requestSingleInstanceLock();
+if (!hasSingleInstanceLock) {
+  app.quit();
+}
 // Diagnostics mode enables the separate `pkaDiag` surface (local simulation).
 // It is off in a normal launch; use --dev, --audit/--smoke or PKA_DIAGNOSTICS=1.
 const diagnostics = audit || smoke || process.argv.includes('--dev') || process.env.PKA_DIAGNOSTICS === '1';
@@ -45,7 +66,10 @@ let itemProviderAttempt = null;
 let creatureProviderAttempt = null;
 const CREATURES_FILE = path.resolve(root, process.env.PKA_CREATURES_FILE || path.join(dataRoot, 'live-creatures.json'));
 const ITEMS_FILE = path.resolve(root, process.env.PKA_ITEMS_FILE || path.join(dataRoot, 'live-items.json'));
+const PIDFILE = path.join(dataRoot, 'providers.pid');
+const providerTracker = createTracker({ pidFile: PIDFILE, spawnImpl: spawn });
 let livePid = null;
+let channelBackend = false;
 let lastProviderState = null;
 let engineRuntime = null;
 let simulation = null;
@@ -53,6 +77,71 @@ let monitor = null;
 let lookWindow = null;
 let simEnabled = process.env.PKA_SIMULATE === '1' || process.argv.includes('--simulate');
 let keyboardBackend = false;
+let activeStore = null;
+let activeController = null;
+const verifiedBuilds = new Map();
+let savingBuildSha = false;
+let chainConnecting = false;
+let lastChainConnectAttempt = 0;
+let chainSessionStartedAt = 0;
+let chainCooldownUntil = 0;
+
+function isChainConfig(config) {
+  return config?.tools?.telemetry?.mode === 'chain' || config?.telemetry?.mode === 'chain';
+}
+
+function activeNormalizedConfig() {
+  if (!activeStore) return null;
+  const snap = activeStore.snapshot();
+  const active = snap.profiles.find(profile => profile.name === snap.activeProfile);
+  return migrateTelemetry(active?.config || {});
+}
+
+function isChainModeActive() {
+  if (simEnabled || smoke || audit || !activeStore) return false;
+  return isChainConfig(activeNormalizedConfig());
+}
+
+function legacySpawnAllowed(configOverride) {
+  const cfg = configOverride ? migrateTelemetry(configOverride) : activeNormalizedConfig();
+  return shouldSpawnLegacy(cfg, { simEnabled, smoke, keyboardBackend, env: process.env });
+}
+
+function ensurePidBuildVerified(pid) {
+  if (simEnabled || smoke || audit || !Number.isInteger(pid) || pid <= 0) return null;
+  const cached = verifiedBuilds.get(pid);
+  if (cached && (cached.path || Date.now() - cached.checkedAt < 15000)) return cached;
+  const info = { ...verifyExecutableForPid(pid), checkedAt: Date.now() };
+  verifiedBuilds.set(pid, info);
+  if (info.supported && info.sha256 && activeStore && !savingBuildSha) {
+    const snap = activeStore.snapshot();
+    const active = snap.profiles.find(profile => profile.name === snap.activeProfile);
+    if (active) {
+      const nextConfig = normalizeTelemetry(active.config);
+      if (nextConfig.tools.telemetry.executableSha256 !== info.sha256
+          || nextConfig.telemetry?.executableSha256 !== info.sha256) {
+        nextConfig.tools.telemetry.executableSha256 = info.sha256;
+        nextConfig.telemetry.executableSha256 = info.sha256;
+        savingBuildSha = true;
+        activeStore.save(active.name, nextConfig).then(() => {
+          if (window && !window.isDestroyed() && activeController) {
+            window.webContents.send('pka:settings', activeController.settings());
+          }
+        }).catch(() => {}).finally(() => { savingBuildSha = false; });
+      }
+    }
+  }
+  return info;
+}
+
+function applyBuildSessionState(session) {
+  if (!session || simEnabled || smoke || audit) return session;
+  const build = ensurePidBuildVerified(session.pid);
+  if (build && build.path && !build.supported) {
+    return { ...session, online: false, error: 'unsupported-build' };
+  }
+  return session;
+}
 
 // Diagnostics-only: (re)builds the simulation and stops the engines. Never part
 // of the recovered IPC surface; only reachable through `pka-diag:simulate`.
@@ -72,6 +161,7 @@ async function toggleSimulation(enabled, options) {
     health: options && Number.isFinite(options.health) ? options.health : undefined,
     activeSlot: options && Number.isInteger(options.activeSlot) ? options.activeSlot : undefined });
   // Close the runtime so the next module start reconnects to THIS simulation.
+  if (engineRuntime && next) engineRuntime.frameAutomation = null;
   await engineRuntime?.close().catch(() => {});
   return { enabled: simEnabled };
 }
@@ -138,14 +228,16 @@ function providerStatus(value) {
   }
 }
 
-function startCreatureProvider(python, pid, playerName) {
+function startCreatureProvider(python, pid, playerName, normalizedConfig) {
+  if (typeof legacySpawnAllowed === 'function' && !legacySpawnAllowed(normalizedConfig)) return;
   if (process.env.PKA_CREATURES_FILE || creatureProvider
       || typeof playerName !== 'string' || !playerName.trim()
       || !Number.isInteger(pid) || pid <= 0) return;
   const identity = JSON.stringify([pid, playerName.trim()]);
   if (creatureProviderAttempt === identity) return;
   creatureProviderAttempt = identity;
-  const child = spawn(python, [path.join(root, 'tools/scan_creatures.py'), '--pid', String(pid),
+  const spawner = typeof providerTracker !== 'undefined' ? providerTracker.spawnTracked : spawn;
+  const child = spawner(python, [path.join(root, 'tools/scan_creatures.py'), '--pid', String(pid),
     '--player-name', playerName.trim(), '--stream', '--interval-ms', '300',
     '--output', CREATURES_FILE], { cwd: root, windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
   creatureProvider = child;
@@ -163,13 +255,15 @@ function startCreatureProvider(python, pid, playerName) {
   });
 }
 
-function startItemProvider(python, pid, playerName) {
+function startItemProvider(python, pid, playerName, normalizedConfig) {
+  if (typeof legacySpawnAllowed === 'function' && !legacySpawnAllowed(normalizedConfig)) return;
   if (!keyboardBackend || process.env.PKA_ITEMS_FILE || itemProvider
       || typeof playerName !== 'string' || !playerName.trim()) return;
   const identity = JSON.stringify([pid, playerName.trim()]);
   if (itemProviderAttempt === identity) return;
   itemProviderAttempt = identity;
-  const child = spawn(python, [path.join(root, 'tools/scan_items.py'), '--pid', String(pid),
+  const spawner = typeof providerTracker !== 'undefined' ? providerTracker.spawnTracked : spawn;
+  const child = spawner(python, [path.join(root, 'tools/scan_items.py'), '--pid', String(pid),
     '--player', playerName.trim(), '--output', ITEMS_FILE, '--interval', '0.2'],
   { cwd: root, windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
   itemProvider = child;
@@ -184,23 +278,31 @@ function startItemProvider(python, pid, playerName) {
   });
 }
 
-function startLiveProvider() {
+function startLiveProvider(normalizedConfig) {
   if (smoke || audit || liveProvider || !fs.existsSync(PROVIDER)) return;
+  if (typeof legacySpawnAllowed === 'function' && !legacySpawnAllowed(normalizedConfig)) return;
+  if (typeof isChainModeActive === 'function' && isChainModeActive()) return;
   const python = process.env.PKA_PYTHON || 'python';
   try {
     const options = providerOptions(root, process.env, discoverProcesses());
     livePid = options.pid;
-    liveProvider = spawn(python, [PROVIDER, ...options.args, '--creatures-interval-s', '0'],
+    const build = typeof ensurePidBuildVerified === 'function' ? ensurePidBuildVerified(livePid) : null;
+    const chainRva = typeof chainRvaFor === 'function'
+      ? (chainRvaFor(normalizedConfig?.telemetry?.executableSha256 || build?.sha256) || '0x3A03598')
+      : null;
+    const extraArgs = chainRva ? ['--chain-rva', chainRva, '--no-scan', '--creatures-interval-s', '5'] : ['--creatures-interval-s', '5'];
+    const spawner = typeof providerTracker !== 'undefined' ? providerTracker.spawnTracked : spawn;
+    liveProvider = spawner(python, [PROVIDER, ...options.args, ...extraArgs],
       { cwd: root, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
-    startCreatureProvider(python, livePid, process.env.PKA_PLAYER_NAME);
-    startItemProvider(python, livePid, process.env.PKA_PLAYER_NAME);
+    startCreatureProvider(python, livePid, process.env.PKA_PLAYER_NAME, normalizedConfig);
+    startItemProvider(python, livePid, process.env.PKA_PLAYER_NAME, normalizedConfig);
     providerStatus({ status: 'starting' });
     createInterface({ input: liveProvider.stdout }).on('line', line => {
       try {
         const status = JSON.parse(line);
         if (status.ok && status.pid === livePid) {
-          startCreatureProvider(python, livePid, status.player?.name);
-          startItemProvider(python, livePid, status.player?.name);
+          startCreatureProvider(python, livePid, status.player?.name, normalizedConfig);
+          startItemProvider(python, livePid, status.player?.name, normalizedConfig);
         }
         providerStatus({ status: status.ok ? 'observing' : status.errorCode === 'process-access-denied' ? 'blocked' : 'waiting',
           error: status.error || null, errorCode: status.errorCode || null, win32Error: status.win32Error ?? null });
@@ -274,9 +376,11 @@ function mapInfo(controller) {
 function stopLiveProvider() {
   itemProviderAttempt = null;
   creatureProviderAttempt = null;
-  if (itemProvider) { try { itemProvider.kill(); } catch {} itemProvider = null; }
-  if (creatureProvider) { try { creatureProvider.kill(); } catch {} creatureProvider = null; }
+  providerTracker.stopAll();
+  if (itemProvider) { killTree(itemProvider.pid); try { itemProvider.kill(); } catch {} itemProvider = null; }
+  if (creatureProvider) { killTree(creatureProvider.pid); try { creatureProvider.kill(); } catch {} creatureProvider = null; }
   if (!liveProvider) return;
+  killTree(liveProvider.pid);
   try { liveProvider.kill(); } catch (_) { /* ignore */ }
   liveProvider = null;
 }
@@ -284,12 +388,20 @@ function stopLiveProvider() {
 function getLiveSessions() {
   if (smoke) return [];
   if (simEnabled && simulation) return [simulation.snapshot()];
-  if (!fs.existsSync(SNAPSHOT_FILE)) return [];
+  if (!fs.existsSync(SNAPSHOT_FILE)) {
+    if (livePid) {
+      const build = ensurePidBuildVerified(livePid);
+      if (build && build.path && !build.supported) {
+        return [{ pid: livePid, online: false, stale: false, ageMs: 0, error: 'unsupported-build', telemetry: {} }];
+      }
+    }
+    return [];
+  }
   try {
     const raw = JSON.parse(fs.readFileSync(SNAPSHOT_FILE, 'utf8'));
     if (raw.pid !== livePid) return [];
     const session = rpmSession(raw);
-    return session ? [session] : [];
+    return session ? [applyBuildSessionState(session)] : [];
   } catch (_) {
     return [];
   }
@@ -308,12 +420,39 @@ const ready = app.whenReady().then(async () => {
   session.defaultSession.setPermissionCheckHandler(() => false);
   const store = new SettingsStore(path.join(dataRoot, 'profiles'));
   await store.load();
+  const loadedSnap = store.snapshot();
+  if (loadedSnap.profiles.some(p => !p.config?.tools?.telemetry || !p.config?.telemetry)) {
+    await store.transact(data => ({
+      ...data,
+      profiles: data.profiles.map(p => ({ ...p, config: migrateTelemetry(p.config) })),
+    }));
+  }
+  activeStore = store;
+  const reaped = reapStale({ pidFile: PIDFILE, rootDir: root, reconcileLive: true });
+  if (reaped.length) console.warn('[reaper] encerrou processos orfaos:', reaped.join(', '));
+  if (!smoke && !audit) {
+    const preBoot = inspectReaderDescendants(process.pid);
+    if (preBoot.readers.length || preBoot.python.length) {
+      console.error('[guard] leitores residuais antes do boot:', preBoot.readers.map(p => p.ProcessId));
+    }
+  }
   simulation = createSimulation({ pid: 777 });
   // Only the audit/smoke harnesses force the non-keyboard runtime; the separate
   // diagnostics surface (--dev, PKA_DIAGNOSTICS=1) must keep the real
   // keyboard-rpm backend so Iniciar actually reaches the game. Simulation still
   // selects the native/simulation runtime through simEnabled/--simulate.
-  const keyboardWalker = useKeyboardWalker(process.env, audit || smoke, simEnabled);
+  /* Sem PKA_CHANNEL_KEY(_FILE) a UI cairia no teclado. Como a interface ja
+   * injeta sozinha, exponha a chave do arquivo padrao antes de decidir. */
+  if (!process.env.PKA_CHANNEL_KEY && !process.env.PKA_CHANNEL_KEY_FILE) {
+    try {
+      const key = fs.readFileSync(path.join(root, 'native', 'pka_channel_key.txt'), 'utf8').trim();
+      if (key) process.env.PKA_CHANNEL_KEY = key;
+    } catch { /* sem arquivo: segue o backend keyboard */ }
+  }
+  const startupSnap = store.snapshot();
+  const startupProfile = startupSnap.profiles.find(profile => profile.name === startupSnap.activeProfile);
+  const startupChain = !simEnabled && !audit && !smoke && isChainConfig(startupProfile?.config);
+  const keyboardWalker = startupChain ? false : useKeyboardWalker(process.env, audit || smoke, simEnabled);
   keyboardBackend = keyboardWalker && !smoke;
   engineRuntime = smoke ? null : keyboardWalker ? new RpmCombatRuntime({
     mapProvider: () => loadDefaultMap(),
@@ -329,8 +468,67 @@ const ready = app.whenReady().then(async () => {
      * aba do menu; sem ele, tenta o padrao. Falha de leitura nao derruba a
      * automacao: o walker so' cai no guloso. */
     mapProvider: simEnabled ? undefined : () => loadDefaultMap(),
-    openAdapter: options => (simEnabled ? simulation.open(options) : nativeAdapter.open(options)),
+    openAdapter: async options => {
+      if (simEnabled) return simulation.open(options);
+      const cfg = migrateTelemetry(options?.config || {});
+      const mode = cfg.telemetry.mode;
+      if (mode === 'replay') return replayAdapter.open({ ...options, config: cfg });
+      if (mode === 'chain') return chainAdapter.open({ ...options, pidFile: PIDFILE, config: cfg });
+      /* A interface injeta sozinha (modulo neutro) quando o canal nao existe.
+       * Falha aqui nao impede o keyboard backend: ele so' conecta depois. */
+      const channel = await ensureChannel(options?.pid || Number(process.env.PKA_PID) || 0, { root,
+        inject: process.env.PKA_NO_INJECT !== '1' });
+      if (!channel.injected && channel.reason && channel.reason !== 'pipe-present' && channel.reason !== 'pipe-ready') {
+        console.warn('[channel] ' + channel.reason);
+      }
+      return nativeAdapter.open(options);
+    },
   });
+  channelBackend = !simEnabled && !keyboardWalker && !smoke && !audit;
+  const bootLegacyIfAllowed = cfg => {
+    const res = bootProviders(cfg, {
+      simEnabled,
+      smoke,
+      keyboardBackend,
+      startLegacy: legacyCfg => startLiveProvider(legacyCfg),
+    });
+    if (res.legacySpawned) {
+      lastProviderState = {
+        status: 'legacy',
+        legacy: true,
+        error: 'Modo legado Python ativo' + (process.env.PKA_LEGACY_PYTHON === '1' ? ' (PKA_LEGACY_PYTHON=1).' : '.'),
+      };
+    }
+    return res;
+  };
+  const reconnectToPid = async newPid => {
+    if (Date.now() < chainCooldownUntil) return false;
+    const pidCheck = validateGameProcessPid(newPid);
+    if (!pidCheck.valid) return false;
+    const build = ensurePidBuildVerified(newPid);
+    if (build && build.path && !build.supported) return false;
+    await engineRuntime?.close().catch(() => {});
+    stopLiveProvider();
+    reapStale({ pidFile: PIDFILE, rootDir: root, reconcileLive: true });
+    const activeCfg = activeNormalizedConfig();
+    await engineRuntime.connect(newPid, activeCfg || undefined);
+    chainSessionStartedAt = Date.now();
+    bootLegacyIfAllowed(activeCfg);
+    console.log('[chain] conectado pid=' + newPid);
+    return true;
+  };
+  if (channelBackend) {
+    try {
+      const pids = discoverProcesses();
+      const pid = selectPid(pids, process.env.PKA_PID);
+      const ok = await reconnectToPid(pid);
+      if (!ok) throw Error('unsupported-or-invalid-pid');
+    } catch (error) {
+      console.warn('[channel] auto-connect: ' + error.message);
+    }
+  }
+  const bootCfg = activeNormalizedConfig();
+  bootLegacyIfAllowed(bootCfg);
   monitor = createMonitorRuntime({
     // A sessao tem que vir do backend ATIVO: no canal nativo ela esta no adapter
     // (EngineRuntime.sessions); no backend keyboard, no provider RPM. Ler sempre
@@ -342,19 +540,45 @@ const ready = app.whenReady().then(async () => {
     send: (channel, value) => { if (window && !window.isDestroyed()) window.webContents.send(channel, value); },
     onPause: () => { void engineRuntime?.pause().catch(() => {}); },
   });
+  const runtimeConfig = config => {
+    if (!config) return config;
+    const normalized = normalizeTelemetry(config);
+    if (!simEnabled) return normalized;
+    const { telemetry: _ignored, ...rest } = normalized;
+    return rest;
+  };
+  const runtimePort = !engineRuntime ? null : {
+    get sessions() { return (engineRuntime.sessions || []).map(applyBuildSessionState); },
+    get state() {
+      const state = engineRuntime.state;
+      const build = !simEnabled && state?.pid ? verifiedBuilds.get(state.pid) : null;
+      return build && build.path && !build.supported ? { ...state, error: 'unsupported-build' } : state;
+    },
+    togglePause: () => engineRuntime.togglePause(),
+    updateConfig: config => engineRuntime.updateConfig?.(runtimeConfig(config)),
+    setModules: async (module, enabled, pid, config) => {
+      if (enabled && !simEnabled && Number.isInteger(pid) && pid > 0) {
+        const build = ensurePidBuildVerified(pid);
+        if (build && build.path && !build.supported) throw Error('unsupported-build');
+      }
+      return engineRuntime.setModules(module, enabled, pid, runtimeConfig(config));
+    },
+  };
   const controller = new Controller(store, {
     copyText: text => clipboard.writeText(text),
     quit: async () => {
       try { lookWindow?.destroy(); monitor?.close(); await engineRuntime?.close(); } finally { stopLiveProvider(); window?.destroy(); app.quit(); }
     },
-    runtime: engineRuntime,
+    runtime: runtimePort,
     getSessions: getLiveSessions,
     command: async (pid, name, parameter) => {
       if (!engineRuntime) throw Error(nativeUnavailable);
+      const build = ensurePidBuildVerified(pid);
+      if (build && build.path && !build.supported) throw Error('unsupported-build');
       if (!engineRuntime.connected) {
         const current = store.snapshot();
         const active = current.profiles.find(profile => profile.name === current.activeProfile);
-        await engineRuntime.connect(pid, active ? active.config : undefined);
+        await engineRuntime.connect(pid, active ? runtimeConfig(active.config) : undefined);
       }
       return engineRuntime.manualCommand(pid, name, parameter);
     },
@@ -459,6 +683,7 @@ const ready = app.whenReady().then(async () => {
     copyAlertHistory: () => true,
     guildDailyReset: () => ({ accepted: true }),
   });
+  activeController = controller;
   window = new BrowserWindow({ width: 1180, height: 880, show: !smoke && !audit,
     title: 'PKA Tools - reconstrucao local',
     webPreferences: { preload: path.join(__dirname, 'preload.cjs'), sandbox: true,
@@ -473,10 +698,12 @@ const ready = app.whenReady().then(async () => {
   });
   window.on('closed', () => { monitor?.close(); void engineRuntime?.close().catch(error => failures.push({ kind: 'runtime-close', message: error.message })); });
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
-  startLiveProvider();
   window.webContents.once('did-finish-load', () => {
     if (lastProviderState?.error && window && !window.isDestroyed()) {
-      window.webContents.send('pka:notice', { kind: 'error', message: lastProviderState.error });
+      window.webContents.send('pka:notice', {
+        kind: lastProviderState.legacy ? 'warning' : 'error',
+        message: lastProviderState.error,
+      });
     }
   });
   window.on('page-title-updated', event => event.preventDefault());
@@ -541,17 +768,85 @@ const ready = app.whenReady().then(async () => {
   };
   showStatus();
   if (!smoke) {
+    const checkReaderInvariant = () => {
+      if (simEnabled || audit) return;
+      const cfg = activeNormalizedConfig();
+      const mode = cfg?.telemetry?.mode || 'chain';
+      if (mode === 'native' || legacySpawnAllowed(cfg)) return;
+      const seen = inspectReaderDescendants(process.pid);
+      if (seen.python.length > 0 || seen.readerRoots.length > 1) {
+        const msg = '[invariant] leitores fora do esperado (' + mode + '): python='
+          + seen.python.length + ', readers=' + seen.readerRoots.length;
+        console.error(msg);
+        if (seen.readerRoots.length > 1) {
+          for (const extra of seen.readerRoots.slice(1)) killTree(Number(extra.ProcessId));
+        }
+        if (window && !window.isDestroyed() && !window.webContents.isLoading()) {
+          window.webContents.send('pka:notice', { kind: 'error', message: msg });
+        }
+      }
+    };
+    const invariantTimers = [5000, 30000, 120000].map(ms => {
+      const t = setTimeout(checkReaderInvariant, ms);
+      t.unref?.();
+      return t;
+    });
+    const invariantInterval = setInterval(checkReaderInvariant, 60000);
+    invariantInterval.unref?.();
+
     const liveTimer = setInterval(() => {
       if (!window || window.isDestroyed()) {
         clearInterval(liveTimer);
         return;
       }
-      if (!liveProvider && !simEnabled) {
-        startLiveProvider();
+      if (!liveProvider && !simEnabled && legacySpawnAllowed()) {
+        startLiveProvider(activeNormalizedConfig());
+      }
+      if (!audit && !simEnabled && engineRuntime && isChainModeActive()) {
+        const cfg = activeNormalizedConfig();
+        const maxMin = Number(cfg?.telemetry?.maxSessionMin) || 20;
+        const cooldownMin = Number(cfg?.telemetry?.cooldownMin ?? 5);
+        if (engineRuntime.connected && chainSessionStartedAt > 0
+            && Date.now() - chainSessionStartedAt >= maxMin * 60000) {
+          chainSessionStartedAt = 0;
+          chainCooldownUntil = Date.now() + cooldownMin * 60000;
+          chainConnecting = true;
+          Promise.resolve().then(async () => {
+            await engineRuntime.close();
+            stopLiveProvider();
+            const msg = 'Sessao chain encerrada (teto ' + maxMin + ' min). Cooldown de ' + cooldownMin + ' min.';
+            console.warn('[chain] ' + msg);
+            if (window && !window.isDestroyed()) {
+              window.webContents.send('pka:notice', { kind: 'warning', message: msg });
+            }
+          }).catch(() => {}).finally(() => { chainConnecting = false; });
+        } else if (!chainConnecting && Date.now() >= chainCooldownUntil
+            && Date.now() - lastChainConnectAttempt >= 5000) {
+          lastChainConnectAttempt = Date.now();
+          chainConnecting = true;
+          Promise.resolve().then(async () => {
+            if (engineRuntime.connected && engineRuntime.pid) {
+              const alive = validateGameProcessPid(engineRuntime.pid);
+              if (alive.valid) return;
+              console.warn('[chain] PID do jogo encerrado (' + engineRuntime.pid + '); limpando sessao');
+              chainSessionStartedAt = 0;
+              await engineRuntime.close();
+              stopLiveProvider();
+            }
+            const pids = discoverProcesses();
+            if (!pids.length) return;
+            const pid = selectPid(pids, process.env.PKA_PID);
+            await reconnectToPid(pid);
+          }).catch(() => {}).finally(() => { chainConnecting = false; });
+        }
       }
       window.webContents.send('pka:snapshot', controller.snapshot());
     }, 1000);
-    window.on('closed', () => clearInterval(liveTimer));
+    window.on('closed', () => {
+      clearInterval(liveTimer);
+      clearInterval(invariantInterval);
+      for (const t of invariantTimers) clearTimeout(t);
+    });
   }
   if (liveAudit) {
     if (!keyboardWalker || diagnostics || simEnabled) throw Error('Live audit requires the real keyboard/RPM backend.');
@@ -616,5 +911,8 @@ const ready = app.whenReady().then(async () => {
 });
 ready.catch(error => { console.error(error.stack); app.exit(1); });
 app.on('before-quit', stopLiveProvider);
-app.on('will-quit', () => globalShortcut.unregisterAll());
-app.on('window-all-closed', () => app.quit());
+app.on('will-quit', () => { stopLiveProvider(); globalShortcut.unregisterAll(); });
+app.on('window-all-closed', () => { stopLiveProvider(); app.quit(); });
+for (const sig of ['SIGINT', 'SIGTERM']) {
+  process.on(sig, () => { stopLiveProvider(); app.quit(); });
+}

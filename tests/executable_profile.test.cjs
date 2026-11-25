@@ -51,11 +51,18 @@ test('lookup is case-insensitive and rejects unknown builds', () => {
 });
 
 test('each supported build declares its layout and typeOffset matches', () => {
+  const expected = new Map([
+    [OLD, ['build-2026-10', '0x186']],
+    [NEW, ['build-2026-11-03', '0x186']],
+    ['0ec61b0e401396660988943701c0417e7fce87d46a32f0dd641e7c0cf9b1f29e', ['build-2026-11-20', '0x176']],
+    ['14cad59648656a8f128d1582d9ad7e358a8f421798ccc26ee611ed52cc935ed8', ['build-2026-11-22', '0x176']],
+    ['ed2560a00801b26796d8d666cf46d503a0c25c56075338e9102baef0d2f9c986', ['build-2026-11-23', '0x176']],
+  ]);
+  assert.deepEqual(new Set(SUPPORTED_EXECUTABLE_SHA256), new Set(expected.keys()));
   for (const sha of SUPPORTED_EXECUTABLE_SHA256) {
     const layout = layoutFor(sha);
     assert.ok(layout, 'layout ausente para ' + sha);
-    assert.equal(layout.typeOffset, '0x186');
-    assert.ok(layout.label);
+    assert.deepEqual([layout.label, layout.typeOffset], expected.get(sha));
   }
   assert.equal(layoutFor('deadbeef'), null);
 });

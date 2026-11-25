@@ -41,9 +41,78 @@ function makeMap(walls = []) {
 
 const pos = (x, y) => ({ x, y, z: 0 });
 
+test('suaviza a reta conhecida sem mudar o custo nem cortar quina', () => {
+  const free = { seen: true, walkable: true };
+  const from = pos(10, 10), to = pos(16, 14);
+  assert.deepEqual(plannerFor({ tile: () => free }).plan(from, to), { direction: 5, remaining: 62 });
+  for (const obstacle of [{ seen: true, walkable: false }, { seen: false }]) {
+    const map = { tile: point => point.x === 10 && point.y === 11 ? obstacle : free };
+    assert.notEqual(plannerFor(map).plan(from, to).direction, 5);
+  }
+});
+
+test('suavizacao nao atravessa parede: corredor em L chega sem tile bloqueado', () => {
+  const free = { seen: true, walkable: true };
+  const wall = { seen: true, walkable: false };
+  const walls = new Set();
+  for (let y = 0; y <= 9; y += 1) walls.add(`13,${y}`);
+  const map = { tile: point => (walls.has(`${point.x},${point.y}`) ? wall : free) };
+  const planner = plannerFor(map);
+  const delta = { 0: [0, -1], 1: [1, 0], 2: [0, 1], 3: [-1, 0],
+    4: [1, -1], 5: [1, 1], 6: [-1, 1], 7: [-1, -1] };
+  let position = { x: 10, y: 5, z: 0 };
+  const goal = { x: 16, y: 5, z: 0 };
+  let steps = 0;
+  while ((position.x !== goal.x || position.y !== goal.y) && steps < 40) {
+    const plan = planner.plan(position, goal);
+    assert.ok(plan && Number.isInteger(plan.direction), 'plano ausente em ' + steps);
+    const [dx, dy] = delta[plan.direction];
+    position = { x: position.x + dx, y: position.y + dy, z: 0 };
+    assert.ok(map.tile(position).walkable, 'passo bloqueado em ' + JSON.stringify(position));
+    steps += 1;
+  }
+  assert.deepEqual(position, goal);
+  assert.ok(steps <= 16, 'caminho longo demais: ' + steps);
+});
+
+test('suavizacao nao corta quina entre dois tiles bloqueados', () => {
+  const free = { seen: true, walkable: true };
+  const wall = { seen: true, walkable: false };
+  const map = { tile: point => ((point.x === 11 && point.y === 10) || (point.x === 10 && point.y === 11)
+    ? wall : free) };
+  const plan = plannerFor(map).plan(pos(10, 10), pos(12, 12));
+  assert.ok(plan && Number.isInteger(plan.direction));
+  assert.notEqual(plan.direction, 5, 'nao pode sair na diagonal que corta a quina');
+});
+
 function plannerFor(map) {
   return createPathPlanner({ getMap: () => map, now: () => 0, cacheMs: 0 });
 }
+
+test('only distinct stalled samples trigger a detour, with and without a map', () => {
+  for (const mapped of [true, false]) {
+    const planner = mapped ? plannerFor({ tile: () => ({ seen: true, walkable: true }) }) : null;
+    const engine = createWalkerEngine({ walker: { loop: false, stepIntervalMs: 0,
+      waypoints: [{ action: 'walk', pos: pos(20,10) }] } }, { stepPlanner: planner });
+    const step = tick => engine.step({ position: pos(10,10), tick }, { command() {} }, tick * 100);
+    const first = step(1);
+    for (const tick of [2,2,2,3,2]) assert.equal(step(tick).action, 'hold');
+    const detour = step(4);
+    assert.equal(detour.reason, mapped ? 'obstacle-replanned' : 'obstacle-detour');
+    assert.notEqual(detour.direction, first.direction);
+  }
+});
+
+test('enclosed dead end has no route, including diagonally across its corners', () => {
+  const planner = plannerFor({ tile: ({ x, y }) => ({ seen: true, walkable: Math.abs(x-10) + Math.abs(y-10) !== 1 }) });
+  assert.equal(planner.plan(pos(10,10),pos(20,10)), null);
+});
+
+test('with a map an unreachable goal does not trigger a greedy step into a dead end', () => {
+  const planner = plannerFor({ tile: ({ x, y }) => ({ seen: true, walkable: y === 10 && [10,11,15].includes(x) }) });
+  const engine = createWalkerEngine({ walker: { waypoints: [{ action: 'walk', pos: pos(15,10) }] } }, { stepPlanner: planner });
+  assert.equal(engine.step({ position: pos(10,10), tick: 1 }, { command: assert.fail }, 0).reason, 'map-blocked');
+});
 
 /* Segue o plano ate' chegar, como o walker faria. */
 function walkPlan(planner, from, goal, limit = 80) {

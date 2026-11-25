@@ -1,6 +1,5 @@
 # creature_identity.py
 import datetime
-import hashlib
 import json
 import math
 import struct
@@ -15,7 +14,11 @@ SUPPORTED_EXECUTABLE_SHA256 = {
     # confirmado por locate_by_name + global [0x39cb958] + RTTI em
     # docs/POSICAO_CONFIRMADA.md. Nao remover sem revalidar contra o cliente.
     "48c41bd4422842e7a73890c4e65fc0714beb80c191ca274612a86ebe27b0ac2b",
+    # build 2026-11-20 (exe de 32.110.128 bytes, sha do arquivo
+    # 0EC61B0E...). Mesmo layout shifted -0x10 do build anterior.
+    "0ec61b0e401396660988943701c0417e7fce87d46a32f0dd641e7c0cf9b1f29e",
 }
+LAYOUT_20261120 = "ed455f4bf4d84f11a44aa73340a2edc6165b8202aeb660d051ae09a6f9ab4b77"
 TYPE_OFFSET = 0x186
 CREATURE_VTABLE = 0x7FF72C721E20
 PLAYER_VTABLE = 0x7FF72C7233E8
@@ -35,11 +38,22 @@ BASE_LAYOUTS = {
     # build 2026-11-09
     LAYOUT_BASE_SHIFTED: {"pos": 0x20, "id": 0x4C, "name": 0x70, "hp": 0xB0,
                           "canAttack": 0xB4, "type": 0x176},
+    # build 2026-11-20: mesmo deslocamento (hash do ARQUIVO e da imagem)
+    LAYOUT_20261120: {"pos": 0x20, "id": 0x4C, "name": 0x70, "hp": 0xB0,
+                      "canAttack": 0xB4, "type": 0x176},
+    "0ec61b0e401396660988943701c0417e7fce87d46a32f0dd641e7c0cf9b1f29e": {"pos": 0x20, "id": 0x4C, "name": 0x70, "hp": 0xB0,
+                      "canAttack": 0xB4, "type": 0x176},
 }
 
 
 def layout_for_sha(sha):
     return BASE_LAYOUTS.get((sha or "").lower(), BASE_LAYOUTS["default"])
+
+
+def verified_layout(sha):
+    if sha not in SUPPORTED_EXECUTABLE_SHA256:
+        raise ValueError(f'unknown executable identity: {sha}')
+    return layout_for_sha(sha)
 
 
 class TargetMovedError(ValueError):
@@ -50,6 +64,8 @@ def resolve_profile(handle, pid):
     import pointer_scan_entities as pe
     import otclient_rtti as rtti
 
+    sha = sc.process_sha256(handle)
+    layout = verified_layout(sha)
     module = next(m for m in pe.enum_modules(pid) if m["name"].lower() == sc.IMAGE_NAME.lower())
     image = rtti.read_module_image(handle, module["base"], module["size"])
     resolved = {}
@@ -58,12 +74,11 @@ def resolve_profile(handle, pid):
     c_vt = resolved["Creature"]["vtable"] if resolved["Creature"] else rtti.KNOWN_VTABLES.get("Creature")
     p_vt = resolved["Player"]["vtable"] if resolved["Player"] else rtti.KNOWN_VTABLES.get("Player")
 
-    sha = hashlib.sha256(image).hexdigest()
     return {
         "executableSha256": sha,
         "moduleBase": module["base"],
-        "typeOffset": layout_for_sha(sha)["type"],
-        "layout": layout_for_sha(sha),
+        "typeOffset": layout["type"],
+        "layout": layout,
         "creatureVtable": c_vt,
         "playerVtable": p_vt
     }

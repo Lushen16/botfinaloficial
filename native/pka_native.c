@@ -35,6 +35,59 @@
 
 #pragma comment(lib, "bcrypt.lib")
 
+/* --------------------------------------------------- nome do modulo e PEB
+ * O anticheat do cliente enumera modulos carregados. Guardamos a pasta no
+ * init e, depois de tudo pronto, desligamos a entrada da DLL das listas do
+ * PEB: ela continua mapeada e funcional, mas some de EnumProcessModules. */
+static char g_moduleDir[MAX_PATH];
+static HMODULE g_selfModule;
+
+typedef struct { USHORT Length, MaximumLength; PWSTR Buffer; } uni_string_t;
+typedef struct { ULONG Length; BOOLEAN Initialized; PVOID SsHandle;
+    LIST_ENTRY InLoadOrderModuleList; LIST_ENTRY InMemoryOrderModuleList;
+    LIST_ENTRY InInitializationOrderModuleList; } peb_ldr_t;
+typedef struct { BYTE pad[0x18]; peb_ldr_t *Ldr; } peb_t;
+typedef struct { LIST_ENTRY InLoadOrderLinks; LIST_ENTRY InMemoryOrderLinks;
+    LIST_ENTRY InInitializationOrderLinks; PVOID DllBase; } ldr_entry_t;
+
+static void cache_module_dir(HINSTANCE inst)
+{
+    DWORD n = GetModuleFileNameA(inst, g_moduleDir, (DWORD)sizeof g_moduleDir);
+    if (!n || n >= sizeof g_moduleDir) { g_moduleDir[0] = 0; return; }
+    char *slash = strrchr(g_moduleDir, '\\');
+    if (slash) *(slash + 1) = 0;
+}
+
+static int module_file(char *out, size_t cap, const char *name)
+{
+    if (!g_moduleDir[0]) return 0;
+    snprintf(out, cap, "%s%s", g_moduleDir, name);
+    return 1;
+}
+
+static void unlink_one(LIST_ENTRY *link)
+{
+    link->Flink->Blink = link->Blink;
+    link->Blink->Flink = link->Flink;
+}
+
+static void hide_self(HMODULE self)
+{
+    if (!self) return;
+    peb_t *peb = (peb_t *)__readgsqword(0x60);
+    if (!peb || !peb->Ldr) return;
+    LIST_ENTRY *load = &peb->Ldr->InLoadOrderModuleList;
+    for (LIST_ENTRY *it = load->Flink; it != load; it = it->Flink) {
+        ldr_entry_t *entry = (ldr_entry_t *)it;
+        if ((HMODULE)entry->DllBase != self) continue;
+        unlink_one(&entry->InLoadOrderLinks);
+        unlink_one(&entry->InMemoryOrderLinks);
+        unlink_one(&entry->InInitializationOrderLinks);
+        return;
+    }
+}
+
+
 #define MAX_FRAME 2105344u
 #define NONCE_SIZE 32
 #define PIPE_BUFFER 65536
@@ -245,24 +298,13 @@ static int key_load(void)
         return 1;
     }
 
-    /* ao lado da DLL: GetModuleFileNameA do proprio modulo */
-    char module[MAX_PATH];
-    HMODULE self = NULL;
-    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           (LPCSTR)(uintptr_t)&key_load, &self)) {
-        DWORD n = GetModuleFileNameA(self, module, (DWORD)sizeof module);
-        if (n > 0 && n < sizeof module) {
-            char *slash = strrchr(module, '\\');
-            if (slash) {
-                *(slash + 1) = 0;
-                char candidate[MAX_PATH];
-                snprintf(candidate, sizeof candidate, "%spka_channel_key.txt", module);
-                if (key_from_file(candidate)) {
-                    log_line("chave lida de %s (%zu bytes)", candidate, g_keyLen);
-                    return 1;
-                }
-            }
+    /* ao lado da DLL (pasta cacheada: a DLL some do PEB depois) */
+    {
+        char candidate[MAX_PATH];
+        if (module_file(candidate, sizeof candidate, "pka_channel_key.txt")
+            && key_from_file(candidate)) {
+            log_line("chave lida de %s (%zu bytes)", candidate, g_keyLen);
+            return 1;
         }
     }
 
@@ -687,21 +729,7 @@ static const char *player_name_config(void)
     cachedAt = now;
 
     char path[MAX_PATH];
-    path[0] = 0;
-    char module[MAX_PATH];
-    HMODULE self = NULL;
-    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           (LPCSTR)(uintptr_t)&player_name_config, &self)) {
-        DWORD n = GetModuleFileNameA(self, module, (DWORD)sizeof module);
-        if (n > 0 && n < sizeof module) {
-            char *slash = strrchr(module, '\\');
-            if (slash) {
-                *(slash + 1) = 0;
-                snprintf(path, sizeof path, "%spka_player_name.txt", module);
-            }
-        }
-    }
+    module_file(path, sizeof path, "pka_player_name.txt");
     FILE *f = path[0] ? fopen(path, "rb") : NULL;
     if (!f) {
         char tmp[MAX_PATH];
@@ -750,21 +778,7 @@ static const char *player_name_config(void)
 static DWORD observe_interval_ms(void)
 {
     char path[MAX_PATH];
-    path[0] = 0;
-    char module[MAX_PATH];
-    HMODULE self = NULL;
-    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           (LPCSTR)(uintptr_t)&observe_interval_ms, &self)) {
-        DWORD n = GetModuleFileNameA(self, module, (DWORD)sizeof module);
-        if (n > 0 && n < sizeof module) {
-            char *slash = strrchr(module, '\\');
-            if (slash) {
-                *(slash + 1) = 0;
-                snprintf(path, sizeof path, "%spka_observe_hz.txt", module);
-            }
-        }
-    }
+    module_file(path, sizeof path, "pka_observe_hz.txt");
     FILE *f = path[0] ? fopen(path, "rb") : NULL;
     if (!f) {
         char tmp[MAX_PATH];
@@ -1697,16 +1711,9 @@ static int attack_fire_enabled(void)
 {
     int enabled = 0;
     char path[MAX_PATH];
-    HMODULE self = NULL;
-    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           (LPCSTR)(uintptr_t)&attack_fire_enabled, &self)) {
-        DWORD n = GetModuleFileNameA(self, path, (DWORD)sizeof path);
-        if (n && n < sizeof path) {
-            char *slash = strrchr(path, '\\');
-            if (slash) {
-                snprintf(slash + 1, sizeof path - (size_t)(slash + 1 - path),
-                         "pka_attack_fire.txt");
+    if (module_file(path, sizeof path, "pka_attack_fire.txt")) {
+        {
+            {
                 FILE *f = fopen(path, "r");
                 if (f) {
                     char buf[8] = { 0 };
@@ -3440,9 +3447,10 @@ static uint32_t execute_command(uint32_t id, uint32_t type, const uint8_t *paylo
             log_line("walk recusado: modo background nao suportado (fallback teclado)");
             return STATUS_BACKGROUND_UNSUPPORTED;
         }
+        /* PostMessageA nao depende de foco. Medido 2026-11-20 com o jogo
+         * minimizado: 3/3 passos entregues. O gate virou log. */
         if (!require_foreground(hwnd)) {
-            log_line("walk recusado: janela nao esta em primeiro plano (fallback teclado)");
-            return STATUS_NO_FOREGROUND;
+            log_line("walk: teclado EM SEGUNDO PLANO (postando mesmo assim)");
         }
         if (!tap_key_ex(hwnd, arrows[dir].vk, arrows[dir].scan, 1)) return STATUS_SEND_FAILED;
         return STATUS_OK;
@@ -3885,9 +3893,8 @@ static uint32_t execute_command(uint32_t id, uint32_t type, const uint8_t *paylo
             return STATUS_BACKGROUND_UNSUPPORTED;
         }
         if (!require_foreground(hwnd)) {
-            log_line("%s recusado: janela nao esta em primeiro plano (modo foreground)",
+            log_line("%s: chat EM SEGUNDO PLANO (WM_CHAR mesmo assim)",
                      type == 6 ? "talk" : "combo");
-            return STATUS_NO_FOREGROUND;
         }
         if (!send_chat_text(hwnd, text, textLen)) {
             log_line("%s: falha ao enviar texto no chat", type == 6 ? "talk" : "combo");
@@ -4636,6 +4643,7 @@ static void init_once(void)
 
     g_threads[g_threadCount++] = CreateThread(NULL, 0, scanner_thread, NULL, 0, NULL);
     g_threads[g_threadCount++] = CreateThread(NULL, 0, server_thread, NULL, 0, NULL);
+    hide_self(g_selfModule);
 }
 
 /* Desligamento limpo, chamado em DLL_PROCESS_DETACH.
@@ -4777,6 +4785,8 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
     (void)reserved;
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(inst);
+        g_selfModule = inst;
+        cache_module_dir(inst);
         /* NUNCA fazer I/O aqui. So' dispara a thread de boot. */
         HANDLE t = CreateThread(NULL, 0, boot_thread, NULL, 0, NULL);
         if (t) CloseHandle(t);

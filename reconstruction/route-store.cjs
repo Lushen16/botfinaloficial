@@ -220,7 +220,8 @@ function configToRoute(table, config) {
   const healSkill = target.healSkill || {};
   table.waypoints = (Array.isArray(walker.waypoints) ? walker.waypoints : []).map(point => ({
     pos: { x: point.pos.x, y: point.pos.y, z: point.pos.z },
-    action: point.action, param: point.param === undefined ? '' : String(point.param) }));
+    action: point.action, param: point.param === undefined ? '' : String(point.param),
+    ...(point.stairCheckMonsters === true ? { stairCheckMonsters: true } : {}) }));
   table.smartWalking = walker.smartWalking === true;
   table.startNearestWaypoint = walker.startNearestWaypoint === true;
   if (typeof walker.loop === 'boolean') table.loop = walker.loop;

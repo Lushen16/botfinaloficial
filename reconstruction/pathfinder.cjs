@@ -178,17 +178,48 @@ function createPathPlanner(options = {}) {
     }
     dirs.reverse();
     costs.reverse();
+    if (neighbors === NEIGHBORS && dirs.length > 1) {
+      const anchors = [];
+      let anchorX = from.x, anchorY = from.y;
+      for (const direction of dirs.slice(0, 16)) {
+        anchorX += NEIGHBORS[direction][0];
+        anchorY += NEIGHBORS[direction][1];
+        anchors.push([anchorX, anchorY]);
+      }
+      for (let index = anchors.length - 1; index > 0; index--) {
+        const [endX, endY] = anchors[index];
+        const deltaX = endX - from.x, deltaY = endY - from.y;
+        const span = Math.max(Math.abs(deltaX), Math.abs(deltaY));
+        let lastX = from.x, lastY = from.y, first = null;
+        for (let step = 1; step <= span; step++) {
+          const nextX = from.x + Math.sign(deltaX) * Math.round(step * Math.abs(deltaX) / span);
+          const nextY = from.y + Math.sign(deltaY) * Math.round(step * Math.abs(deltaY) / span);
+          if (classify(map, nextX, nextY, from.z) !== 0 || (nextX !== lastX && nextY !== lastY &&
+              (classify(map, nextX, lastY, from.z) !== 0 || classify(map, lastX, nextY, from.z) !== 0))) break;
+          first ??= NEIGHBORS.find(([dx, dy]) => dx === nextX - lastX && dy === nextY - lastY);
+          lastX = nextX;
+          lastY = nextY;
+          if (step === span) return { direction: first[2], remaining: octile(from.x, from.y, endX, endY)
+            - first[3] + costs.slice(index + 1).reduce((total, cost) => total + cost, 0) };
+        }
+      }
+    }
     return { direction: dirs[0], remaining: costs.slice(1).reduce((total, cost) => total + cost, 0) };
   }
 
-  function plan(from, to) {
+  function plan(from, to, blockedTile) {
     if (!isPosition(from) || !isPosition(to)) return null;
     if (from.z !== to.z) return null;
     const map = getMap();
     if (!map || typeof map.tile !== 'function') return null;
+    if (blockedTile) {
+      return search({ tile: position => samePosition(position, blockedTile)
+        ? { seen: true, walkable: false } : map.tile(position) }, from, to);
+    }
     const key = keyOf(from.x, from.y, from.z) + '>' + keyOf(to.x, to.y, to.z);
     const at = now();
-    if (cache.key === key && cache.map === map && at - cache.at <= cacheMs) return cache.result;
+    if (cache.key === key && cache.map === map && at - cache.at <= cacheMs
+        && cache.result && canStep(from, cache.result.direction)) return cache.result;
     let result = null;
     try { result = search(map, from, to); } catch { result = null; }
     cache = { key, at, map, result };
@@ -207,7 +238,7 @@ function createPathPlanner(options = {}) {
     } catch { return true; }
   }
 
-  return { plan, canStep };
+  return { plan, canStep, hasMap: () => typeof getMap()?.tile === 'function' };
 }
 
 function samePosition(a, b) { return a.x === b.x && a.y === b.y && a.z === b.z; }

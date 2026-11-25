@@ -38,10 +38,9 @@ function makeWorld(start, blockedTiles = []) {
   const blocked = new Set(blockedTiles);
   return {
     get pos() { return { ...state.pos }; },
-    sample() { return { position: { ...state.pos }, tick: state.tick, playerId: 1 }; },
+    sample() { return { position: { ...state.pos }, tick: state.tick++, playerId: 1 }; },
     /* O tick avanca SEMPRE: o jogo publica telemetria mesmo com o corpo preso. */
     apply(direction) {
-      state.tick += 1;
       const delta = DELTA[direction];
       if (!delta) return false;
       const next = { x: state.pos.x + delta[0], y: state.pos.y + delta[1], z: state.pos.z };

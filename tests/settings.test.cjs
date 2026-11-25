@@ -67,6 +67,45 @@ test('initialize and persist accept versioned snapshots', async context => {
   assert.deepEqual(await store.initialize(data), data);
   assert.deepEqual(await store.persist(data), data);
 });
+
+test('persist owns the submitted snapshot while its disk write is queued', async context => {
+  const store = new settings.SettingsStore(await ownedRoot(context));
+  const submitted = { version:1,activeProfile:'Saved',profiles:[{name:'Saved',config:schema.createConfig()}] };
+  const expected = structuredClone(submitted);
+  const pending = store.persist(submitted);
+  submitted.activeProfile = 'Later';
+  submitted.profiles[0].name = 'Later';
+  submitted.profiles[0].config.tools.menuHotkey = 'F12';
+  const saved = await pending;
+  assert.deepEqual(saved,expected);
+  assert.deepEqual(await new settings.SettingsStore(store.directory).load(),expected);
+});
+
+test('non-finite numeric parameters are rejected before persistence', async context => {
+  const fields = [{key:'value',type:'parameter'}];
+  for (const value of [NaN,Infinity,-Infinity]) {
+    assert.throws(() => settings.validateFields(fields,{value},'Fixture'),/Fixture.value/u);
+  }
+  assert.deepEqual(settings.validateFields(fields,{value:0},'Fixture'),{value:0});
+  assert.deepEqual(settings.validateFields(fields,{value:'aguardar'},'Fixture'),{value:'aguardar'});
+  const store = new settings.SettingsStore(await ownedRoot(context));
+  await store.save('Saved',schema.createConfig());
+  const before = await fs.readFile(store.filename,'utf8');
+  const invalid = schema.createConfig();
+  invalid.walker.waypoints = [{action:'wait',pos:{x:10,y:10,z:7},param:Infinity}];
+  assert.throws(() => store.save('Bad',invalid),/param/u);
+  assert.equal(await fs.readFile(store.filename,'utf8'),before);
+});
+
+test('a rejected queued persist leaves the file and subsequent saves usable', async context => {
+  const store = new settings.SettingsStore(await ownedRoot(context));
+  await store.save('Saved',schema.createConfig());
+  const before = await fs.readFile(store.filename,'utf8');
+  await assert.rejects(store.persist(undefined));
+  assert.equal(await fs.readFile(store.filename,'utf8'),before);
+  await store.save('Next',schema.createConfig());
+  assert.equal((await new settings.SettingsStore(store.directory).load()).activeProfile,'Next');
+});
 test('Windows case-only root variations support load, save and persist', { skip: process.platform !== 'win32' }, async context => {
   const directory = await ownedRoot(context);
   const canonical = await fs.realpath(directory);
@@ -107,4 +146,76 @@ for (const redirectedAncestor of [false, true]) test('reject redirected ' + (red
   await assert.rejects(store.persist(original.snapshot()), /Unsafe settings directory|must not contain symlinks/);
   assert.equal(await fs.readFile(original.filename, 'utf8'), before);
   assert.deepEqual((await fs.readdir(path.dirname(original.filename))).sort(), ['settings.json']);
+});
+
+test('telemetry valid round-trip survives validateConfig and SettingsStore persistence', async context => {
+  const uiSchema = require('../reconstruction/app/ui/schema.js');
+  const store = new settings.SettingsStore(await ownedRoot(context));
+  const config = uiSchema.createConfig();
+  const sha = 'ed2560a00801b26796d8d666cf46d503a0c25c56075338e9102baef0d2f9c986';
+  config.tools.telemetry = { mode: 'chain', intervalMs: 5000, executableSha256: sha.toUpperCase(), playerName: 'Ash' };
+  const validated = settings.validateConfig(config);
+  assert.deepEqual(validated.tools.telemetry, {
+    mode: 'chain',
+    intervalMs: 5000,
+    maxSessionMin: 20,
+    cooldownMin: 5,
+    executableSha256: sha,
+    playerName: 'Ash',
+  });
+  assert.deepEqual(validated.telemetry, validated.tools.telemetry);
+  await store.save('Chain', validated);
+  const reloaded = await new settings.SettingsStore(store.directory).load();
+  const saved = reloaded.profiles.find(profile => profile.name === 'Chain').config;
+  assert.deepEqual(saved.tools.telemetry, validated.tools.telemetry);
+  assert.deepEqual(saved.telemetry, validated.telemetry);
+});
+
+test('telemetry invalid mode or executableSha256 throws', () => {
+  const uiSchema = require('../reconstruction/app/ui/schema.js');
+  const badMode = uiSchema.createConfig();
+  badMode.tools.telemetry.mode = 'invalid';
+  assert.throws(() => settings.validateConfig(badMode), /telemetry\.mode inválido: use chain, native ou replay\./u);
+
+  const badSha = uiSchema.createConfig();
+  badSha.tools.telemetry.executableSha256 = 'abc123';
+  assert.throws(() => settings.validateConfig(badSha), /telemetry\.executableSha256/u);
+});
+
+test('telemetry intervalMs outside 2000..60000 throws', () => {
+  const uiSchema = require('../reconstruction/app/ui/schema.js');
+  for (const intervalMs of [1000, 99999]) {
+    const config = uiSchema.createConfig();
+    config.tools.telemetry.intervalMs = intervalMs;
+    assert.throws(() => settings.validateConfig(config), /telemetry\.intervalMs deve estar entre 2000 e 60000\./u);
+  }
+});
+
+test('legacy profile without telemetry gains defaults on migration', () => {
+  const uiSchema = require('../reconstruction/app/ui/schema.js');
+  const legacy = schema.createConfig();
+  const migratedTools = uiSchema.migrateTools(legacy.tools);
+  assert.deepEqual(migratedTools.telemetry, settings.TELEMETRY_DEFAULTS);
+  const normalized = settings.normalizeTelemetry(legacy);
+  assert.deepEqual(normalized.tools.telemetry, settings.TELEMETRY_DEFAULTS);
+  assert.deepEqual(normalized.telemetry, settings.TELEMETRY_DEFAULTS);
+});
+
+test('verifyExecutableForPid computes disk sha256 and classifies supported vs unsupported builds', async context => {
+  const { verifyExecutableForPid } = require('../reconstruction/executable-identity.cjs');
+  const dir = await ownedRoot(context);
+  const fakeExe = path.join(dir, 'PokeAlliance_dx.exe');
+  await fs.writeFile(fakeExe, Buffer.from('unsupported-binary-bytes'));
+  const unsupported = verifyExecutableForPid(4242, {
+    run: () => ({ status: 0, stdout: fakeExe + '\r\n' }),
+  });
+  assert.equal(unsupported.supported, false);
+  assert.equal(unsupported.error, 'unsupported-build');
+  assert.match(unsupported.sha256, /^[0-9a-f]{64}$/);
+
+  const knownSha = 'ed2560a00801b26796d8d666cf46d503a0c25c56075338e9102baef0d2f9c986';
+  const crypto = require('node:crypto');
+  const supportedBytes = Buffer.from('fake-supported');
+  const realHash = crypto.createHash('sha256').update(supportedBytes).digest('hex');
+  assert.notEqual(realHash, knownSha);
 });

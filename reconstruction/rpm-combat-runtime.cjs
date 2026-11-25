@@ -88,7 +88,7 @@ class RpmCombatRuntime extends WalkerInputRuntime {
           throw Object.assign(Error('A versão do cliente detectada pela leitura de criaturas não tem perfil de compatibilidade confirmado.'),
             { code: 'COMBAT_PROFILE_UNSUPPORTED' });
         }
-        if (profile.typeOffset !== layout.typeOffset) {
+        if (Number(profile.typeOffset) !== Number(layout.typeOffset)) {
           throw Object.assign(Error('O perfil informado pela leitura de criaturas não corresponde à versão do cliente.'),
             { code: 'COMBAT_PROFILE_MISMATCH' });
         }

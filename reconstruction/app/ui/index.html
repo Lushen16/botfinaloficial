@@ -59,6 +59,18 @@
               <progress id="hp-bar" max="100" value="0" aria-label="HP do player"></progress>
               <p id="connection-hint" class="hint">Abra o jogo e conecte pelo loader para usar os controles.</p>
               <p id="pokemon-state" class="hint">Pokebar e mapa aguardando atualização.</p>
+              <section class="sample-status" aria-labelledby="sample-status-title">
+                <h2 id="sample-status-title">Status das amostras</h2>
+                <p id="sample-creatures" class="sample-badge" role="status" aria-atomic="true">Criaturas: sem informação</p>
+                <dl>
+                  <div><dt>Canal informado</dt><dd id="sample-mode">—</dd></div>
+                  <div><dt>Intervalo configurado</dt><dd id="sample-interval">—</dd></div>
+                  <div><dt>Sequência</dt><dd id="sample-seq">—</dd></div>
+                  <div><dt>Idade da amostra</dt><dd id="sample-age">—</dd></div>
+                  <div><dt>Itens</dt><dd id="sample-items">Sem informação</dd></div>
+                </dl>
+                <p id="sample-build-error" class="sample-error" role="status" hidden></p>
+              </section>
             </div>
             <div class="manual-controls">
               <div class="direction-pad" aria-label="Andar uma posição">

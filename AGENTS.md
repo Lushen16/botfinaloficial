@@ -124,7 +124,13 @@ Portanto:
 com o jogo atrás — inutilizando o autoRevive do Shiba (`autoRevive.hotkey: "f"`).
 
 Correto: postar primeiro; `PKA_EXECUTOR_MODE=background` continua sendo recusa
-**explícita** para auditoria. `walk` mantém o gate de foco.
+**explícita** para auditoria.
+
+Medido de novo em 2026-11-20 com o jogo **minimizado** e outra janela em
+primeiro plano: `PostMessageA` move o personagem (3 de 3 passos), `attack`
+executa (handler rc=11) e `combo` entrega o texto (status 0). O gate de foco
+para `walk` e para o fallback de chat foi removido — foco deixou de ser
+pré-requisito. `PKA_EXECUTOR_MODE=background` continua recusando por desenho.
 
 ### Perfect lure — os campos são de `target`, não de `hoenn`
 
@@ -265,6 +271,69 @@ no ponto em que o `automation` decide não rodar o walker — mesma solução qu
 
 Lição registrada: antes de inventar campo novo, verificar se o problema é
 política (o quê fazer) ou ciclo de vida (o que sobrevive entre ticks).
+
+---
+
+## ✅ Medido em 2026-11-21 — leitura externa e antiban
+
+Conta nova, um cliente, personagem parado; nada de scan quando o teste diz
+"cadeia". Resultado (o ban aparece no título da janela, ~minutos depois):
+
+| exposição | tempo | resultado |
+| :--- | :--- | :--- |
+| nada rodando | 15 min | safe |
+| handle aberto, **0 leitura** | 10 min | safe |
+| 4 bytes na base do módulo @ 0,2 Hz | 10 min | safe |
+| cadeia + nome + pos + hp @ 0,2 Hz | 15 min | safe |
+| 2 passos por `PostMessageW` + cadeia @ 0,2 Hz | 10 min | safe |
+| runtime completo em `telemetry.mode:'chain'` (leitura 2 s + passo) | 12 s + 1 tile real | safe |
+| posição a 300 ms (3,3 Hz) | 10 min | **ban** |
+| varredura de toda a memória (105 MB) | minutos | **ban** |
+| crawl de containers 1×/s | 3,5 min | **ban** |
+
+Regra prática: **o gatilho é a varredura**, não o `ReadProcessMemory` em si.
+Telemetria por cadeia de ponteiros em taxa baixa (≤ 0,5 Hz) sobrevive; qualquer
+varredura de espaço de endereço tomba a conta.
+
+Cadeia por build (o RVA muda a cada build — reescanear quando atualizar):
+
+```
+build 21/11 (sha 0ec61b0e...): rva 0x39F8E08 -> player direto (ponteiro em .data)
+build 22/11 (sha 14cad596...): rva 0x3A03598 (+0x3A035A0 alias) -> player direto
+layout: pos 0x20 | id 0x4C | name 0x70 | hp 0xB0 | canAttack 0xB4 | type 0x176
+```
+
+Descoberta do build 22/11: varredura SÓ de `.data`/`.rdata` (4 MB) no PID 28604,
+validada por nome/pos/id e por passo real (`PostMessageW` moveu x 2970→2971).
+O launcher do PokeAlliance reescreve `PokeAlliance_dx.exe` a cada abertura e
+apaga backups; rollback para build antigo não é estável — o perfil por hash é
+o caminho.
+
+`name` em 0x70 é `std::string`: nomes ≤ 15 bytes ficam inline (SSO); maiores
+guardam ponteiro em +0x0 e tamanho em +0x8. `pka_live_session._resolve_name_field`
+trata os dois casos.
+
+### Custo de leitura (build 23/11) — reduzir RPM, não só a taxa
+
+Varredura de descoberta custa as seções inteiras (`.rdata` 8,2 MB + `.data`
+23,7 MB). Fazer UMA vez por build e cachear:
+
+- `tools/creature_chain_discover.py` grava `local-data/creature-chain.json`
+  com `sha`, `rva` e `candidatos`. Na próxima execução com o mesmo sha ele
+  reaproveita os candidatos e **não varre nada**; `--fresh` força.
+  Há guarda de 30 min contra varredura repetida (`chain-scan-guard.json`).
+- `tools/chain_sampler.py` lê **um bloco de 0x180 por entidade** (pos, id,
+  name SSO/ponteiro, hp, canAttack, type) e o player no mesmo esquema:
+  1 leitura por amostra em vez de ~6. Intervalo padrão 5 s.
+- Cadeia de criaturas do build 23/11: `0x39FB498` (vector begin/end/cap).
+  O vetor tem slots vazios/fantasmas; estabilidade entre amostras é o critério.
+- HP de criatura em +0xB0 é **byte** (uint8 0..100); ler 4 bytes devolve lixo
+  (ex.: 16711780). `healthPercent` só é publicado quando o byte ≤ 100.
+
+O Shiba é **100% externo**: com o walker ativo o cliente mantém 98 módulos (todos
+do jogo/sistema) e 73 threads todas dentro de módulos; nenhum PE ou thread
+injetada. Os pipes `pka-*` só existem enquanto o Shiba roda, e o jogo **não**
+conecta neles (servidor nosso no ar desde antes do login, zero `connect`).
 
 ---
 

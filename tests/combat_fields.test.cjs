@@ -29,13 +29,24 @@ test('ignored creature patterns match whole names, case-insensitively, with lite
 });
 
 test('target ignore field removes wildcard matches from inspection and combat', () => {
-  for (const ignoredCreaturesText of ['Shiny *', '*', 'Other; SHINY RAT', 'Other\nShiny *']) {
+  for (const ignoredCreaturesText of ['Shiny *', 'Other; SHINY RAT', 'Other\nShiny *']) {
     const engine = createTargetEngine({ target: { ignoredCreaturesText } });
     const recorder = createRecorder();
     assert.deepEqual(engine.inspect(telemetry()), []);
     assert.equal(engine.step(telemetry(), recorder, 0).action, 'idle');
     assert.deepEqual(recorder.events, []);
   }
+});
+
+test('lone "*" no campo Ignorar vale como nenhum ignorado', () => {
+  /* O perfil real usa "*" e a hunt ficava sem alvo. Curinga isolado = nada
+   * ignorado; padroes como "Shiny *" continuam ignorando. */
+  const engine = createTargetEngine({ target: { ignoredCreaturesText: '*' } });
+  assert.equal(engine.inspect(telemetry()).length, 1);
+  const recorder = createRecorder();
+  const result = engine.step(telemetry(), recorder, 0);
+  assert.notEqual(result.action, 'idle');
+  assert.ok(recorder.events.some(event => event.name === 'attack' || event.name === 'combo'));
 });
 
 test('Hoenn ignore patterns also exclude creatures from Target', () => {

@@ -6,17 +6,76 @@ const { encodeCommand } = require('./protocol.cjs');
 const capabilities = require('./capabilities.cjs');
 const { mergeCreatureSnapshot } = require('../tools/creature_bridge.cjs');
 const nativeAdapter = require('./native-adapter.cjs');
+const chainAdapter = require('./telemetry/chain-adapter.cjs');
+const replayAdapter = require('./telemetry/replay-adapter.cjs');
+const { createSeededRandom } = require('./engines/seeded-random.cjs');
+const { createFrameAutomation } = require('./engines/frame-automation.cjs');
 const { CaptureRuntime } = require('./capture-runtime.cjs');
 const { createTargetEngine } = require('./engines/target-engine.cjs');
 const { createPathPlanner } = require('./pathfinder.cjs');
 
 const MODULES = Object.freeze(['target', 'walker', 'healer']);
 
+function isPositiveAck(ack) {
+  return ack === true || (Boolean(ack) && typeof ack === 'object' && ack.delivered === true && ack.status === 0);
+}
+
+function frameConfigFor(config, modules) {
+  const active = new Set(modules || []);
+  const next = structuredClone(config || {});
+  if (!active.has('target')) {
+    next.target = { ...(next.target || {}), monsters: [] };
+  }
+  if (!active.has('healer')) {
+    next.healer = {};
+    next.hoenn = { ...(next.hoenn || {}), potionHpPercent: 0 };
+  }
+  return next;
+}
+
+function normalizeOrders(orders = []) {
+  return orders.map((order) => {
+    if (order.name === 'attack' && order.parameter && !order.parameter.pos) {
+      return { name: 'attack', parameter: { pos: order.parameter } };
+    }
+    if (order.name === 'capture' && order.parameter?.pos) {
+      const { pos, ballKey, ballSlot } = order.parameter;
+      return { name: 'capture', parameter: { x: pos.x, y: pos.y, ball: ballKey ?? ballSlot } };
+    }
+    return order;
+  });
+}
+
 class EngineRuntime extends EventEmitter {
+  static replay(config = {}, samples = []) {
+    const frameEngine = createFrameAutomation(config);
+    const walkerEngine = createAutomation(config, { now: () => 0 }).walker;
+    const outputs = [];
+    for (const { now, snapshot } of samples) {
+      const decision = frameEngine.tick(structuredClone(snapshot), now);
+      decision.orders = normalizeOrders(decision.orders);
+      if (decision.pauseWalker) {
+        if (decision.phase !== 'await-frame') walkerEngine.notifySkipped();
+      } else {
+        const telemetry = snapshot.telemetry || {};
+        decision.walk = walkerEngine.step({
+          ...telemetry,
+          position: telemetry.player?.pos ?? telemetry.position,
+          playerId: telemetry.player?.id,
+          tick: telemetry.seq,
+        }, { command(name, parameter) { decision.orders.push({ name, parameter }); } }, now);
+      }
+      outputs.push(decision);
+    }
+    return outputs;
+  }
+
   constructor(options = {}) {
     super();
     this.now = options.now || Date.now;
-    this.openAdapter = options.openAdapter || nativeAdapter.open;
+    this.adapterFactory = options.openAdapter || null;
+    this.openAdapter = this.adapterFactory || chainAdapter.open;
+    this.frameAutomation = null;
     this.creatureSource = options.creatureSource;
     /* Mapa OTMM para o walker. Quem chama decide a fonte (aba do mapa, mapa
      * padrao); sem provider o motor segue guloso. */
@@ -166,13 +225,18 @@ class EngineRuntime extends EventEmitter {
       this.automation = createAutomation(structuredClone(config), { now: this.now,
         isEnabled: name => this.modules.includes(name),
         stepPlanner: this.plannerFor(),
-        hotkeysBlocked: () => this.lastHotkeyAt !== null && this.now() - this.lastHotkeyAt < 250 });
+        hotkeysBlocked: () => this.lastHotkeyAt !== null && this.now() - this.lastHotkeyAt < 250,
+        random: config?.walker?.seed != null ? createSeededRandom(config.walker.seed) : undefined });
       this.configSignature = signature;
+      this.frameAutomation = config?.telemetry?.mode === 'chain'
+        ? createFrameAutomation(frameConfigFor(this.config, next)) : null;
+    } else if (config?.telemetry?.mode === 'chain') {
+      this.frameAutomation = createFrameAutomation(frameConfigFor(this.config, next));
     }
     if (!this.adapter) {
       this.connection = new AbortController();
       try {
-        this.adapter = await this.openAdapter({ pid, config, signal: this.connection.signal });
+        this.adapter = await this.adapterFor(config)({ pid, config, signal: this.connection.signal });
         if (!this.adapter || typeof this.adapter.getSnapshot !== 'function'
             || typeof this.adapter.command !== 'function' || typeof this.adapter.close !== 'function'
             || typeof this.adapter.pauseWalker !== 'function' || !Array.isArray(this.adapter.supportedCommands)) {
@@ -452,7 +516,7 @@ class EngineRuntime extends EventEmitter {
     if (!this.adapter.supportedCommands.includes(name)) throw Error('Comando sem suporte: ' + name);
     encodeCommand(1, name, parameter, extra);
     const command = this.bounded(() => this.adapter.command(name, parameter, { pid: this.pid, extra }), name);
-    if (await command !== true) throw Error('Comando sem ACK positivo: ' + name);
+    if (!isPositiveAck(await command)) throw Error('Comando sem ACK positivo: ' + name);
     return true;
   }
 
@@ -462,6 +526,14 @@ class EngineRuntime extends EventEmitter {
 
   // Opens the transport for manual control without enabling any engine. The
   // menu's direction pad / attack / follow must work before a module is started.
+  adapterFor(config) {
+    if (this.adapterFactory) return this.adapterFactory;
+    const mode = config?.telemetry?.mode ?? config?.tools?.telemetry?.mode;
+    if (mode === 'replay') return replayAdapter.open;
+    if (mode === 'native') return nativeAdapter.open;
+    return chainAdapter.open;
+  }
+
   async connect(pid, config) {
     if (this.adapter && this.pid === pid) return this.adapter;
     if (!Number.isInteger(pid) || pid <= 0) throw Error('Selecione uma sessao com PID valido.');
@@ -473,13 +545,16 @@ class EngineRuntime extends EventEmitter {
       this.automation = createAutomation(structuredClone(config || {}), { now: this.now,
         isEnabled: name => this.modules.includes(name),
         stepPlanner: this.plannerFor(),
-        hotkeysBlocked: () => this.lastHotkeyAt !== null && this.now() - this.lastHotkeyAt < 250 });
+        hotkeysBlocked: () => this.lastHotkeyAt !== null && this.now() - this.lastHotkeyAt < 250,
+        random: config?.walker?.seed != null ? createSeededRandom(config.walker.seed) : undefined });
       this.configSignature = JSON.stringify(config);
+      this.frameAutomation = config && config.telemetry && config.telemetry.mode === 'chain'
+        ? createFrameAutomation(this.config || config || {}) : null;
     }
     if (!this.adapter) {
       this.connection = new AbortController();
       try {
-        this.adapter = await this.openAdapter({ pid, config, signal: this.connection.signal });
+        this.adapter = await this.adapterFor(config)({ pid, config, signal: this.connection.signal });
         if (!this.adapter || typeof this.adapter.getSnapshot !== 'function'
             || typeof this.adapter.command !== 'function' || typeof this.adapter.close !== 'function'
             || typeof this.adapter.pauseWalker !== 'function' || !Array.isArray(this.adapter.supportedCommands)) {
@@ -497,6 +572,52 @@ class EngineRuntime extends EventEmitter {
     return this.adapter;
   }
 
+  async runFrameTick(snapshot, epoch) {
+    const telemetry = snapshot.telemetry || {};
+    const frame = { ...snapshot, telemetry: { ...telemetry,
+      seq: telemetry.seq ?? snapshot.seq ?? Math.round(this.now()),
+      player: telemetry.player ?? (telemetry.position
+        ? { id: telemetry.playerId, pos: telemetry.position, name: telemetry.playerName } : null) } };
+    const decision = this.frameAutomation.tick(frame, this.now());
+    const orders = normalizeOrders(decision.orders);
+    if (decision.pauseWalker) {
+      if (decision.phase !== 'await-frame') this.automation.walker?.notifySkipped?.();
+    } else if (this.modules.includes('walker') && this.automation?.walker) {
+      const walkerOrders = [];
+      const walkerRecorder = {
+        command(name, parameter, extra) { walkerOrders.push({ name, parameter, extra }); },
+      };
+      decision.walk = this.automation.walker.step({
+        ...telemetry,
+        position: telemetry.player?.pos ?? telemetry.position,
+        playerId: telemetry.player?.id ?? telemetry.playerId,
+        tick: telemetry.seq,
+      }, walkerRecorder, this.now());
+      orders.push(...walkerOrders);
+    }
+    const faults = [];
+    for (const order of orders) {
+      if (this.paused || epoch !== this.epoch) break;
+      if (!this.adapter.supportedCommands.includes(order.name)) {
+        faults.push({ name: order.name, error: 'Comando sem suporte: ' + order.name });
+        continue;
+      }
+      try {
+        const ack = await this.bounded(() => this.adapter.command(order.name, order.parameter,
+          { pid: this.pid, extra: order.extra }), order.name);
+        if (!isPositiveAck(ack)) faults.push({ name: order.name, error: 'Comando sem ACK positivo' });
+      } catch (error) {
+        faults.push({ name: order.name, error: error.message });
+      }
+    }
+    const result = { status: decision.phase, emitted: orders.map(o => [o.name, o.parameter]),
+      allowMovement: decision.allowMovement, monitor: decision.monitor, targetId: decision.targetId,
+      effectVerified: decision.effectVerified, wildCount: decision.wildCount, walk: decision.walk || null, faults };
+    if (faults.length) this.emit('change', this.state);
+    this.last = result;
+    return result;
+  }
+
   async runTick(epoch) {
     try {
       const snapshot = this.snapshot();
@@ -506,6 +627,9 @@ class EngineRuntime extends EventEmitter {
       }
       const recorder = createRecorder();
       let captureCandidate = null;
+      if (this.frameAutomation) {
+        return await this.runFrameTick(snapshot, epoch);
+      }
       const result = this.automation.tick(snapshot, recorder, (telemetry, inCombat) => {
         const canCapture = this.declaration().commands.includes('useWith')
           && this.adapter.supportedCommands.includes('useWith');
@@ -556,7 +680,7 @@ class EngineRuntime extends EventEmitter {
         this.automation.recordDispatch(event.name, event.parameter, this.now());
         const ack = await this.bounded(() => adapter.command(event.name, event.parameter,
           { pid: this.pid, extra: event.extra }), event.name);
-        if (ack !== true) throw Error('Comando sem ACK positivo: ' + event.name);
+        if (!isPositiveAck(ack)) throw Error('Comando sem ACK positivo: ' + event.name);
         if (event.name === 'attack' && epoch === this.epoch) {
           this.automation.recordAttackDelivery(event.parameter, current.telemetry, this.now());
         }

@@ -32,7 +32,7 @@ test('multiple clients require explicit selection instead of choosing the first'
 test('process query is bounded and fails closed on query errors', () => {
   assert.deepEqual(discoverProcesses((executable, args, options) => {
     assert.equal(executable, 'tasklist.exe');
-    assert.ok(args.includes('IMAGENAME eq PokeAlliance_dx.exe'));
+    assert.ok(!args.includes('/FI'));
     assert.equal(options.timeout, 5000);
     return { status: 0, stdout: '"PokeAlliance_dx.exe","26100"' };
   }), [26100]);

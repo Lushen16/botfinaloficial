@@ -40,7 +40,12 @@ function direction(from, to) {
 }
 
 function ignoredNames(text) {
-  return new Set(String(text || '').split(/[,;\n]/u).map(value => value.trim().toLowerCase()).filter(Boolean));
+  /* `*` sozinho seria "ignora tudo" e deixava a hunt sem alvo (o perfil real
+   * usa "*"). Tratamos o curinga isolado como "nenhum ignorado"; padroes como
+   * "Shiny *" continuam valendo. */
+  return new Set(String(text || '').split(/[,;\n]/u)
+    .map(value => value.trim().toLowerCase())
+    .filter(value => value && value !== '*'));
 }
 
 function normalizeName(value) {

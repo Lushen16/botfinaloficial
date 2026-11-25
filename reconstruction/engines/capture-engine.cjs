@@ -149,5 +149,39 @@ function recordCaptureDispatchResult(history, now, effectiveDelay, accepted) {
       failures: accepted ? 0 : (history.failures + 1) >>> 0 } };
 }
 
-module.exports = { CAPTURE_VERSION, DEFAULT_MAX_DISTANCE, normalizeConfig, selectCaptureCandidate, chooseBall, nextCaptureAt,
+function createFrameCapture(config) {
+  const cfg = normalizeConfig(config);
+  const entries = config?.looting?.captureEntries ?? [];
+  const limit = clamp(config?.looting?.maxAttemptsPerCorpse, 1, 100, 3);
+  const history = new Map();
+  const key = item => JSON.stringify([item.instanceId ?? null, item.id, item.stack ?? 0, item.pos.x, item.pos.y, item.pos.z]);
+  function step(frame, now, inCombat) {
+    if (!cfg.enabled || frame.itemsAvailable !== true || !Array.isArray(frame.items) || !isPos(frame.position)) return null;
+    const visible = frame.items.filter(item => item && isPos(item.pos) && item.pos.z === frame.position.z);
+    const keys = new Set(visible.map(key));
+    for (const id of history.keys()) if (!keys.has(id)) history.delete(id);
+    if (cfg.afterCombat && (inCombat || frame.creaturesAvailable !== true)) return null;
+    let waiting = false;
+    for (const item of visible) {
+      const entry = entries.find(row => row && (row.corpseId === item.id || row.corpseIds?.includes(item.id) ||
+        (item.kind === 'corpse' && row.name && row.name.toLowerCase() === item.name?.toLowerCase())));
+      if (!entry || Math.max(Math.abs(item.pos.x - frame.position.x), Math.abs(item.pos.y - frame.position.y)) > cfg.maxDistance) continue;
+      const id = key(item), previous = history.get(id), attempts = previous?.attempts ?? 0;
+      if (attempts >= limit) continue;
+      const useFallback = attempts > 0 && (entry.fallbackBallKey || entry.fallbackBallSlot);
+      const ballKey = useFallback ? entry.fallbackBallKey : entry.ballKey;
+      const ballSlot = useFallback ? entry.fallbackBallSlot : entry.ballSlot;
+      if (!(typeof ballKey === 'string' && ballKey.trim()) && !(Number.isInteger(ballSlot) && ballSlot > 0)) continue;
+      if (previous && now < previous.nextAt) { waiting = true; continue; }
+      history.set(id, { attempts: attempts + 1, nextAt: nextCaptureAt(now, cfg.delayMs) });
+      return { phase: 'capture', pauseWalker: true, order: { name: 'capture', parameter: {
+        pos: { ...item.pos }, corpseId: item.id, ...(ballKey ? { ballKey } : { ballSlot }), attempt: attempts + 1,
+      } } };
+    }
+    return waiting ? { phase: 'capture-cooldown', pauseWalker: true } : null;
+  }
+  return { step, reset() { history.clear(); } };
+}
+
+module.exports = { createFrameCapture, CAPTURE_VERSION, DEFAULT_MAX_DISTANCE, normalizeConfig, selectCaptureCandidate, chooseBall, nextCaptureAt,
   compareCaptureCandidates, rankCaptureCandidates, revalidateCaptureTarget, prepareCaptureDispatch, recordCaptureDispatchResult };

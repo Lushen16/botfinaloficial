@@ -49,7 +49,7 @@ const TICK_RESET_MIN = 1000;
  *
  * Ajustavel por `walker.stepIntervalMs` (0 desliga o piso).
  */
-const STEP_INTERVAL_MS = 406;
+const STEP_INTERVAL_MS = 300; /* mediana medida no Shiba: 302 ms */
 const STEP_INTERVAL_MAX_MS = 2000;
 
 /**
@@ -149,9 +149,21 @@ function createWalkerEngine(config, options = {}) {
   const stepIntervalMs = Number.isFinite(Number(walker.stepIntervalMs))
     ? Math.min(STEP_INTERVAL_MAX_MS, Math.max(0, Number(walker.stepIntervalMs)))
     : STEP_INTERVAL_MS;
+  /* Humanizacao: jitter na cadencia e pausas ocasionais. O servidor mede o
+   * intervalo entre passos; cadencia fixa por minutos e' assinatura de bot.
+   * Medido no Shiba (20/11/2026, 400 amostras): mediana 302 ms, 22% diagonais.
+   * Opt-in por `walker.humanize` para nao mudar testes deterministicos. */
+  const humanize = walker.humanize === true;
+  const rand = typeof options?.random === 'function' ? options.random : Math.random;
+  const jitterDelay = base => {
+    if (!humanize || base <= 0) return base;
+    const value = base * (0.82 + rand() * 0.46);
+    return Math.max(1, Math.round(value));
+  };
   const state = { index: 0, waitingUntil: 0, lastPosition: null, lastMoveTick: null, attempts: 0, stalls: 0,
     pendingStairs: null, saidIndex: -1, finished: false, started: false, approachFrom: null,
     pendingStep: null, wasSkipped: false, tickSeq: 0, lastDispatchAt: -Infinity,
+    nextStepDelay: stepIntervalMs, humanPauseUntil: 0,
     /* Guarda de orbita (ver ORBIT_SAMPLES): melhor distancia ja' vista ao
      * waypoint atual e quantas amostras seguidas nao melhoraram. */
     bestRemaining: null, orbitSamples: 0, usingPlan: false };
@@ -299,7 +311,7 @@ function createWalkerEngine(config, options = {}) {
         state.pendingStep = null;
         state.attempts += 1;
         state.lastPosition = sample.position;
-        return { confirmed: true, reason: 'no-progress' };
+        return { confirmed: true, reason: 'no-progress', blockedTile: pending.target };
       }
       checkTimeout(now);
       return { hold: 'await-position-sample' };
@@ -393,6 +405,17 @@ function createWalkerEngine(config, options = {}) {
 
   function step(telemetry, sink, now) {
     if (!waypoints.length || state.finished) return { action: 'idle', emitted: [] };
+    const tick = telemetry.tick;
+    /* Amostra repetida: o MESMO tick ja' foi processado. Vale como sinal de
+     * que a telemetria nao avancou, mas NAO bloqueia quando o chamador nao
+     * fornece tick (simulacao/teste determinístico) nem quando o piso de
+     * cadencia ja' libera o proximo passo. */
+    const tickRepetido = Number.isInteger(tick) && Number.isInteger(state.observedTick)
+        && tick <= state.observedTick && state.observedTick - tick < TICK_RESET_MIN;
+    if (tickRepetido && state.pendingStep) {
+      return { action: 'hold', emitted: [], reason: 'await-position-sample', index: state.index };
+    }
+    state.observedTick = tick;
     state.tickSeq += 1;
     clearIfSkipped(now);
     const position = telemetry.position;
@@ -486,6 +509,7 @@ function createWalkerEngine(config, options = {}) {
 
     /* --- Passo em voo: reconciliar antes de qualquer novo despacho --- */
     let reconciled = null;
+    let blockedTile = null;
     if (state.pendingStep) {
       const r = reconcile(telemetry, now);
       if (r.hold) {
@@ -498,7 +522,8 @@ function createWalkerEngine(config, options = {}) {
        * um tick parado. Com a rota no ritmo do chamador (100 ms) e' o que
        * separa "recalculou" de "travou por um tick". O motivo vai no payload
        * para diagnostico. */
-      reconciled = r.abort || null;
+      reconciled = r.abort || r.reason || null;
+      blockedTile = r.blockedTile;
     }
 
     const target = smart ? smartTarget(position, waypoint) : waypoint.pos;
@@ -525,9 +550,27 @@ function createWalkerEngine(config, options = {}) {
      * NAO conta tentativa: esperar a cadencia nao e' passo sem progresso. Se
      * contasse, uma caminhada normal chegaria a STUCK_LIMIT e a rota sairia em
      * diagonal sem motivo. */
-    if (now - state.lastDispatchAt < stepIntervalMs) {
+    if (now < state.humanPauseUntil) {
+      return { action: 'hold', emitted: [], reason: 'humanize-pause', index: state.index,
+        waitMs: state.humanPauseUntil - now };
+    }
+    if (now - state.lastDispatchAt < state.nextStepDelay) {
       return { action: 'hold', emitted: [], reason: 'cadence', index: state.index,
-        waitMs: stepIntervalMs - (now - state.lastDispatchAt) };
+        waitMs: state.nextStepDelay - (now - state.lastDispatchAt) };
+    }
+    /* Pausas como o Shiba: ~20 % dos passos ganham um respiro curto e 0,5 %
+     * vira pausa longa. Medido: 23 de 100 intervalos acima de 600 ms. */
+    if (humanize) {
+      const roll = rand();
+      if (roll < 0.005) {
+        state.humanPauseUntil = now + 1000 + Math.round(rand() * 2000);
+        return { action: 'hold', emitted: [], reason: 'humanize-pause', index: state.index,
+          waitMs: state.humanPauseUntil - now };
+      }
+      state.nextStepDelay = jitterDelay(stepIntervalMs)
+        + (roll < 0.20 ? 150 + Math.round(rand() * 400) : 0);
+    } else {
+      state.nextStepDelay = stepIntervalMs;
     }
 
     /* --- Plano de passo ---
@@ -538,7 +581,7 @@ function createWalkerEngine(config, options = {}) {
      * euclidiana. */
     let planned = null;
     if (planner && waypoint.action !== 'stairs') {
-      try { planned = planner.plan(position, waypoint.pos); } catch { planned = null; }
+      try { planned = planner.plan(position, waypoint.pos, blockedTile); } catch { planned = null; }
       if (planned && !Number.isInteger(planned.direction)) planned = null;
     }
     const remaining = planned ? planned.remaining : planeDistance(position, waypoint.pos);
@@ -554,14 +597,14 @@ function createWalkerEngine(config, options = {}) {
     const stuck = sameTile(position, state.lastPosition);
     state.attempts = stuck ? state.attempts + 1 : 0;
     let move = planned ? planned.direction : direction(position, target);
-    if (state.attempts >= STUCK_LIMIT) {
+    if (blockedTile || state.attempts >= STUCK_LIMIT) {
       /* Sem plano, `clockwise` e' o unico contorno. Com plano, tenta manter a
        * rota e so' desvia se ela insistir em bater. */
       if (!planned) move = clockwise(move);
       if (state.attempts >= STALL_LIMIT) return next([], 'stuck');
     }
     if (!planned && waypoint.action !== 'stairs' && position.z === waypoint.pos.z
-        && planner?.canStep?.(position, move) === false) {
+        && (planner?.hasMap?.() || planner?.canStep?.(position, move) === false)) {
       state.lastPosition = position;
       state.lastDispatchAt = now;
       return { action: 'hold', emitted: [], reason: 'map-blocked', index: state.index };
@@ -593,6 +636,7 @@ function createWalkerEngine(config, options = {}) {
     state.lastPosition = position;
     state.lastMoveTick = Number.isInteger(telemetry.tick) ? telemetry.tick : null;
     return { action: 'move', emitted: [['walk', move]], direction: move, index: state.index,
+      ...(blockedTile ? { reason: planned ? 'obstacle-replanned' : 'obstacle-detour' } : {}),
       ...(reconciled ? { reconciled } : {}) };
   }
 
@@ -611,7 +655,7 @@ function createWalkerEngine(config, options = {}) {
      * a proxima rota herdaria a melhor distancia da ANTERIOR e dispararia
      * `stuck` cedo; se `orbitSamples` sobrevivesse, o contador comecaria
      * poluido e a rota morreria antes de tentar. */
-    reset() { Object.assign(state, { index: 0, waitingUntil: 0, lastPosition: null, lastMoveTick: null, attempts: 0, stalls: 0,
+    reset() { Object.assign(state, { index: 0, waitingUntil: 0, lastPosition: null, lastMoveTick: null, observedTick: null, attempts: 0, stalls: 0,
       pendingStairs: null, saidIndex: -1, finished: false, started: false, approachFrom: null, pendingStep: null, wasSkipped: false, tickSeq: 0, lastDispatchAt: -Infinity,
       bestRemaining: null, orbitSamples: 0, usingPlan: false }); },
     get state() { return { index: state.index, pendingStairs: state.pendingStairs, finished: state.finished, total: waypoints.length,

@@ -40,7 +40,7 @@ OFF_TYPE = 0x176
 ENTITY_SIZE = 0x190
 
 # RVAs conhecidas da vtable de LocalPlayer. Sao ATALHO: validadas antes do uso.
-PLAYER_VTABLE_RVAS = (0x1FB5660, 0x1FAC310, 0x1F3F1F0)
+PLAYER_VTABLE_RVAS = (0x1FDB2A8, 0x1FB5660, 0x1FAC310, 0x1F3F1F0)
 
 k32 = ctypes.WinDLL('kernel32', use_last_error=True)
 k32.OpenProcess.restype = wintypes.HANDLE

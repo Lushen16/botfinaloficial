@@ -5,8 +5,61 @@ const { setTimeout: delay } = require('node:timers/promises');
 const schema = require('../readable/shared/schema.js');
 const walker = require('../readable/shared/walker.js');
 const MAX_BYTES = 2097152;
+const TELEMETRY_DEFAULTS = Object.freeze({ mode: 'chain', intervalMs: 5000, maxSessionMin: 20, cooldownMin: 5, executableSha256: '', playerName: '' });
+const TELEMETRY_MODES = new Set(['chain', 'native', 'replay']);
 const clone = value => JSON.parse(JSON.stringify(value));
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+function validateTelemetry(raw) {
+  if (raw === undefined) return { ...TELEMETRY_DEFAULTS };
+  if (!object(raw)) throw Error('telemetry: objeto inválido.');
+  const telemetry = { ...TELEMETRY_DEFAULTS, ...raw };
+  if (!TELEMETRY_MODES.has(telemetry.mode)) {
+    throw Error('telemetry.mode inválido: use chain, native ou replay.');
+  }
+  if (!Number.isInteger(telemetry.intervalMs) || telemetry.intervalMs < 2000 || telemetry.intervalMs > 60000) {
+    throw Error('telemetry.intervalMs deve estar entre 2000 e 60000.');
+  }
+  if (!Number.isInteger(telemetry.maxSessionMin) || telemetry.maxSessionMin < 1 || telemetry.maxSessionMin > 240) {
+    throw Error('telemetry.maxSessionMin deve estar entre 1 e 240.');
+  }
+  if (!Number.isInteger(telemetry.cooldownMin) || telemetry.cooldownMin < 0 || telemetry.cooldownMin > 120) {
+    throw Error('telemetry.cooldownMin deve estar entre 0 e 120.');
+  }
+  if (typeof telemetry.executableSha256 !== 'string'
+      || (telemetry.executableSha256 !== '' && !/^[0-9a-f]{64}$/i.test(telemetry.executableSha256))) {
+    throw Error('telemetry.executableSha256 inválido: use SHA-256 hex de 64 caracteres ou vazio.');
+  }
+  if (typeof telemetry.playerName !== 'string' || telemetry.playerName.length > 200000) {
+    throw Error('telemetry.playerName inválido.');
+  }
+  return {
+    mode: telemetry.mode,
+    intervalMs: telemetry.intervalMs,
+    maxSessionMin: telemetry.maxSessionMin,
+    cooldownMin: telemetry.cooldownMin,
+    executableSha256: telemetry.executableSha256 ? telemetry.executableSha256.toLowerCase() : '',
+    playerName: telemetry.playerName,
+  };
+}
+function normalizeTelemetry(config) {
+  if (!object(config)) throw Error('Configuração inválida.');
+  const source = config.tools?.telemetry !== undefined ? config.tools.telemetry : config.telemetry;
+  const telemetry = validateTelemetry(source);
+  return validateConfig({
+    ...config,
+    tools: { ...(object(config.tools) ? config.tools : {}), telemetry },
+    telemetry,
+  });
+}
+function migrateTelemetry(config) {
+  const base = schema.createConfig();
+  const src = object(config) ? config : {};
+  const candidate = { ...base, ...src };
+  for (const tab of schema.tabs) {
+    if (object(src[tab.key])) candidate[tab.key] = { ...base[tab.key], ...src[tab.key] };
+  }
+  return normalizeTelemetry(candidate);
+}
 function profileName(value) {
   if (typeof value !== 'string' || !value.trim() || value.length > 80 || /[\x00-\x1f]/u.test(value)) throw Error('Nome do perfil inválido (máximo 80 caracteres).');
   return value.trim();
@@ -24,6 +77,19 @@ function characterDirectory(root, name) {
   const slug = key.replace(/[<>:"/\\|?*\x00-\x1f.]/gu, '_').slice(0, 60);
   return path.join(root, 'electron', 'characters', slug + '-' + crypto.createHash('sha256').update(key).digest('hex').slice(0, 16));
 }
+/* Perfis antigos nao tem campos novos (ex.: looting.ballSlot). Preenche o
+ * default do schema antes de validar, sem tocar no que ja' existe. */
+function fillDefaults(fields, config) {
+  if (!object(config)) return config;
+  const result = { ...config };
+  for (const field of fields) {
+    if (field.type === 'object') result[field.key] = fillDefaults(field.fields, result[field.key] ?? {});
+    else if (result[field.key] === undefined) {
+      result[field.key] = field.type === 'list' ? [] : field.default;
+    }
+  }
+  return result;
+}
 function validateFields(fields, config, label) {
   if (!object(config)) throw Error(label + ': objeto inválido.');
   const result = {};
@@ -40,7 +106,12 @@ function validateFields(fields, config, label) {
       if (['text', 'code'].includes(field.type) && (typeof value !== 'string' || value.length > 200000)) throw Error(location + ': texto inválido ou muito grande.');
       if (field.type === 'select' && !field.options.includes(value)) throw Error(location + ': opção inválida.');
       if (field.type === 'parameter' && !['string', 'number'].includes(typeof value)) throw Error(location + ': use texto ou número.');
-      result[field.key] = value;
+      /* `typeof NaN === 'number'` e `typeof Infinity === 'number'`: a checagem
+       * de tipo sozinha deixa passar valor que nao pode ser serializado em JSON
+       * (vira `null`) e corrompe o perfil em silencio. */
+      if (field.type === 'parameter' && typeof value === 'number' && !Number.isFinite(value)) {
+        throw Error(location + ': use um número finito.');
+      }      result[field.key] = value;
     }
   }
   return result;
@@ -48,9 +119,18 @@ function validateFields(fields, config, label) {
 function validateConfig(config) {
   if (!object(config)) throw Error('Configuração inválida.');
   const candidate = { ...config };
+  const rawTelemetry = candidate.tools?.telemetry !== undefined
+    ? candidate.tools.telemetry
+    : (config.telemetry !== undefined ? config.telemetry : undefined);
   if (object(candidate.tools)) candidate.tools = schema.migrateTools(candidate.tools);
   if (object(candidate.target)) candidate.target = { ...candidate.target, luring: walker.normalizeLuring(candidate.target.luring) };
+  for (const tab of schema.tabs) candidate[tab.key] = fillDefaults(tab.fields, candidate[tab.key]);
   const result = Object.fromEntries(schema.tabs.map(tab => [tab.key, validateFields(tab.fields, candidate[tab.key], tab.label)]));
+  if (rawTelemetry !== undefined) {
+    const telemetry = validateTelemetry(rawTelemetry);
+    result.tools.telemetry = telemetry;
+    result.telemetry = { ...telemetry };
+  }
   /* Perfis antigos guardavam a hotkey do AutoCombo em `combo.n`. */
   const legacyHotkey = candidate.target?.combo?.n;
   if (object(candidate.target?.combo) && candidate.target.combo.nativeHotkey === undefined && legacyHotkey !== undefined) {
@@ -101,7 +181,18 @@ class SettingsStore {
   snapshot() { return clone(this.data); }
   current() { return clone(this.data.profiles.find(profile => profile.name === this.data.activeProfile).config); }
   initialize(data) { return this.persist(data); }
-  persist(data) { return this.transact(() => validateData(data)); }
+  /* Clona NA CHAMADA, nao dentro do `transact`: o chamador costuma mutar o
+   * objeto logo depois (`submitted.activeProfile = ...`) e o `transact` so'
+   * roda no microtask seguinte. Guardar a referencia fazia a gravacao levar
+   * o estado mutado em vez do snapshot submetido.
+   *
+   * `undefined`/`null` continuam chegando ao `validateData`, que rejeita com a
+   * mensagem de formato — clonar aqui estouraria de forma SINCRONA, antes do
+   * `assert.rejects` poder observar. */
+  persist(data) {
+    const submitted = data === undefined || data === null ? data : clone(data);
+    return this.transact(() => validateData(submitted));
+  }
   transact(change) {
     const operation = this.queue.then(async () => {
       const directory = path.dirname(this.filename);
@@ -167,4 +258,4 @@ class SettingsStore {
     });
   }
 }
-module.exports = { SettingsStore, validateFields, validateConfig, profileName, characterName, characterKey, characterDirectory, MAX_BYTES };
+module.exports = { SettingsStore, validateFields, validateConfig, validateTelemetry, normalizeTelemetry, migrateTelemetry, TELEMETRY_DEFAULTS, profileName, characterName, characterKey, characterDirectory, MAX_BYTES };
