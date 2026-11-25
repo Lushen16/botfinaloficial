@@ -14,6 +14,7 @@ const {
   inspectReaderDescendants,
   bootProviders,
   validateGameProcessPid,
+  createReconnectCoordinator,
 } = require('../reconstruction/app/provider-guard.cjs');
 
 test('perfil sem telemetry migra para chain, nao legacy', () => {
@@ -155,4 +156,88 @@ test('T4: PKA_LEGACY_PYTHON=1 habilita spawn legado apenas com flag explicita', 
   const res = bootProviders(cfg, { env: { PKA_LEGACY_PYTHON: '1' }, startLegacy: () => { called++; } });
   assert.equal(res.legacySpawned, true);
   assert.equal(called, 1);
+});
+
+test('T2: restart do jogo encerra leitor antigo antes de conectar no novo PID (sempre 1 leitor)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pka-t2-'));
+  const pidFile = path.join(dir, 'providers.pid');
+  const events = [];
+  let nowMs = 10_000;
+  let connected = false;
+  let currentPid = null;
+  let activeReaders = new Set();
+  const gamePids = new Set([1001]);
+
+  const coord = createReconnectCoordinator({
+    pidFile,
+    now: () => nowMs,
+    validatePid: pid => (gamePids.has(pid) ? { valid: true, pid } : { valid: false, reason: 'pid-not-found' }),
+    verifyBuild: () => ({ supported: true }),
+    closeRuntime: async () => {
+      if (connected) {
+        events.push('close:' + currentPid);
+        activeReaders.delete(currentPid);
+        connected = false;
+        currentPid = null;
+      }
+    },
+    stopAll: () => { events.push('stopAll'); },
+    reap: () => { events.push('reap'); return []; },
+    connectRuntime: async pid => {
+      assert.equal(activeReaders.size, 0, 'leitor antigo ainda ativo antes do novo connect');
+      events.push('connect:' + pid);
+      activeReaders.add(pid);
+      connected = true;
+      currentPid = pid;
+    },
+    bootLegacy: () => {},
+    discover: () => [...gamePids],
+    pickPid: pids => pids[0],
+  });
+
+  const t0 = await coord.tick({ connected, currentPid, normalizedConfig: migrateTelemetry({}) });
+  assert.equal(t0.action, 'reconnected');
+  assert.equal(activeReaders.size, 1);
+  assert.ok(activeReaders.has(1001));
+
+  // Jogo PID 1001 cai e reabre como PID 1002
+  gamePids.delete(1001);
+  gamePids.add(1002);
+  nowMs += 5000;
+  const t1 = await coord.tick({ connected, currentPid, normalizedConfig: migrateTelemetry({}) });
+  assert.equal(t1.action, 'reconnected');
+  assert.equal(t1.pid, 1002);
+  assert.equal(activeReaders.size, 1);
+  assert.ok(activeReaders.has(1002));
+  assert.ok(events.indexOf('close:1001') < events.indexOf('connect:1002'));
+  assert.ok(events.indexOf('stopAll') < events.indexOf('connect:1002'));
+
+  // Mesmo PID 1002 continua ativo se saudavel; reinicia somente 1 se provider cair (relog)
+  nowMs += 5000;
+  const t2Keep = await coord.tick({ connected, currentPid, providerRunning: true, normalizedConfig: migrateTelemetry({}) });
+  assert.equal(t2Keep.action, 'keep');
+  assert.equal(activeReaders.size, 1);
+
+  nowMs += 5000;
+  const t3Relog = await coord.tick({ connected, currentPid, providerRunning: false, normalizedConfig: migrateTelemetry({}) });
+  assert.equal(t3Relog.action, 'reconnected');
+  assert.equal(activeReaders.size, 1);
+
+  // Teto de maxSessionMin encerra sessao e ativa cooldown
+  nowMs += 20 * 60_000;
+  const t4Stop = await coord.tick({
+    connected,
+    currentPid,
+    normalizedConfig: migrateTelemetry({ tools: { telemetry: { mode: 'chain', intervalMs: 5000, maxSessionMin: 20, cooldownMin: 5 } } }),
+  });
+  assert.equal(t4Stop.action, 'cooldown-stop');
+  assert.equal(activeReaders.size, 0);
+
+  // Durante cooldown nao reconecta
+  nowMs += 60_000;
+  const t5Wait = await coord.tick({ connected, currentPid, normalizedConfig: migrateTelemetry({}) });
+  assert.equal(t5Wait.action, 'wait');
+  assert.equal(activeReaders.size, 0);
+
+  fs.rmSync(dir, { recursive: true, force: true });
 });

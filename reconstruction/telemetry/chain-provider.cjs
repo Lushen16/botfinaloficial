@@ -42,7 +42,7 @@ function unrecordPid(pidFile, pid) {
   } catch {}
 }
 
-function createLiveProvider({ pid, name, chainRva, creatureChainRva, mapTileBlocksRva, tileRadius, intervalMs = 5000, maxSessionMin = DEFAULT_MAX_SESSION_MIN, pidFile = null, python, env = process.env, spawnImpl = spawn } = {}) {
+function createLiveProvider({ pid, name, chainRva, creatureChainRva, mapTileBlocksRva, tileRadius, intervalMs = 5000, maxSessionMin = DEFAULT_MAX_SESSION_MIN, pidFile = null, onExit = null, python, env = process.env, spawnImpl = spawn } = {}) {
   if (!Number.isInteger(pid) || pid <= 0) throw TypeError('pid precisa ser inteiro positivo');
   const usePackaged = !python && spawnImpl === spawn && env.PKA_CHAIN_USE_PYTHON !== '1' && existsSync(PACKAGED_BIN);
   const interval = Math.max(usePackaged ? PROD_MIN_INTERVAL_MS : MIN_INTERVAL_MS, Number(intervalMs) || MIN_INTERVAL_MS);
@@ -121,11 +121,12 @@ function createLiveProvider({ pid, name, chainRva, creatureChainRva, mapTileBloc
           const child = spawnImpl(PACKAGED_BIN, exeArgs, { cwd: ROOT, windowsHide: true, detached: false, env });
           recordPidImmediate(pidFile, child?.pid);
           entry.child = child;
-          child.on('exit', () => {
+          child.on('exit', (code, sig) => {
             unrecordPid(pidFile, child?.pid);
             if (session === entry) {
               detach(entry);
               session = null;
+              if (typeof onExit === 'function') onExit({ code, signal: sig, lastFrame: current });
             }
           });
         });
@@ -145,11 +146,15 @@ function createLiveProvider({ pid, name, chainRva, creatureChainRva, mapTileBloc
           entry.buffer = entry.buffer.slice(index + 1);
         }
       });
-      entry.child.on('exit', () => {
+      entry.child.on('exit', (code, sig) => {
         unrecordPid(pidFile, child?.pid);
-        if (session === entry) session = null;
+        if (session === entry) {
+          session = null;
+          if (typeof onExit === 'function') onExit({ code, signal: sig, lastFrame: current });
+        }
       });
     },
+    isRunning() { return Boolean(session); },
     stop() {
       callback = null;
       const entry = session;

@@ -213,8 +213,10 @@ class EngineRuntime extends EventEmitter {
     if (!Number.isInteger(pid) || pid <= 0) throw Error('Selecione uma sessao com PID valido.');
     const signature = JSON.stringify(config);
     const changed = signature !== this.configSignature || pid !== this.pid;
+    const telemetryChanged = JSON.stringify(this.config?.telemetry || null)
+      !== JSON.stringify(config?.telemetry || null);
     await this.pause();
-    if (this.adapter && pid !== this.pid) {
+    if (this.adapter && (pid !== this.pid || telemetryChanged)) {
       await this.adapter.close();
       this.adapter = null;
     }
@@ -712,6 +714,7 @@ class EngineRuntime extends EventEmitter {
       this.connection?.abort();
       await this.adapter?.close();
       this.adapter = null;
+      this.pid = null;
       this.modules = [];
     }
   }

@@ -191,6 +191,7 @@ async function openChainAdapter({ pid, config, signal, provider: givenProvider, 
     async pauseWalker(paused) { return paused ? true : true; },
     async close() { provider.stop(); events.removeAllListeners(); },
     get intervalMs() { return intervalMs; },
+    get providerRunning() { return typeof provider.isRunning === 'function' ? provider.isRunning() : true; },
   };
   return adapter;
 }

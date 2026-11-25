@@ -256,6 +256,88 @@ function bootProviders(normalizedConfig, {
   return { legacySpawned: true };
 }
 
+function createReconnectCoordinator({
+  pidFile,
+  rootDir = '',
+  validatePid = validateGameProcessPid,
+  verifyBuild = () => ({ supported: true }),
+  closeRuntime = async () => {},
+  stopAll = () => {},
+  reap = opts => reapStale(opts),
+  connectRuntime = async () => {},
+  bootLegacy = () => {},
+  discover = () => [],
+  pickPid = pids => pids[0],
+  now = Date.now,
+} = {}) {
+  let busy = false;
+  let lastAttemptAt = 0;
+  let sessionStartedAt = 0;
+  let cooldownUntil = 0;
+
+  async function reconnect(newPid, normalizedConfig) {
+    if (now() < cooldownUntil) return { ok: false, reason: 'cooldown' };
+    const pidCheck = validatePid(newPid);
+    if (!pidCheck?.valid) return { ok: false, reason: pidCheck?.reason || 'invalid-pid' };
+    const build = verifyBuild(newPid);
+    if (build && build.path && !build.supported) return { ok: false, reason: 'unsupported-build' };
+    await closeRuntime();
+    stopAll();
+    reap({ pidFile, rootDir, reconcileLive: true });
+    await connectRuntime(newPid, normalizedConfig);
+    sessionStartedAt = now();
+    bootLegacy(normalizedConfig);
+    return { ok: true, pid: newPid };
+  }
+
+  async function tick({ connected, currentPid, providerRunning = true, normalizedConfig, minIntervalMs = 5000 } = {}) {
+    if (busy) return { action: 'busy' };
+    const maxMin = Number(normalizedConfig?.telemetry?.maxSessionMin) || 20;
+    const cooldownMin = Number(normalizedConfig?.telemetry?.cooldownMin ?? 5);
+    if (connected && sessionStartedAt > 0 && now() - sessionStartedAt >= maxMin * 60000) {
+      busy = true;
+      try {
+        sessionStartedAt = 0;
+        cooldownUntil = now() + cooldownMin * 60000;
+        await closeRuntime();
+        stopAll();
+        return { action: 'cooldown-stop', maxMin, cooldownMin };
+      } finally {
+        busy = false;
+      }
+    }
+    if (now() < cooldownUntil || now() - lastAttemptAt < minIntervalMs) {
+      return { action: 'wait' };
+    }
+    lastAttemptAt = now();
+    busy = true;
+    try {
+      if (connected && currentPid) {
+        const alive = validatePid(currentPid);
+        if (alive?.valid && providerRunning !== false) {
+          return { action: 'keep', pid: currentPid };
+        }
+        sessionStartedAt = 0;
+        await closeRuntime();
+        stopAll();
+      }
+      const pids = discover();
+      if (!Array.isArray(pids) || !pids.length) return { action: 'no-game' };
+      const pid = pickPid(pids);
+      const res = await reconnect(pid, normalizedConfig);
+      return { action: res.ok ? 'reconnected' : 'rejected', ...res };
+    } finally {
+      busy = false;
+    }
+  }
+
+  return {
+    reconnect,
+    tick,
+    state: () => ({ busy, sessionStartedAt, cooldownUntil }),
+  };
+}
+
 module.exports = {
   LEGACY_CMD_RE: READER_RE,
   READER_RE,
@@ -272,4 +354,5 @@ module.exports = {
   inspectPythonDescendants,
   validateGameProcessPid,
   bootProviders,
+  createReconnectCoordinator,
 };

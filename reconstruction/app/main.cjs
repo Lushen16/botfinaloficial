@@ -30,6 +30,7 @@ const {
   inspectPythonDescendants,
   validateGameProcessPid,
   bootProviders,
+  createReconnectCoordinator,
 } = require('./provider-guard.cjs');
 const os = require('node:os');
 const { OtmmReader } = require('../otmm.cjs');
@@ -451,8 +452,9 @@ const ready = app.whenReady().then(async () => {
   }
   const startupSnap = store.snapshot();
   const startupProfile = startupSnap.profiles.find(profile => profile.name === startupSnap.activeProfile);
-  const startupChain = !simEnabled && !audit && !smoke && isChainConfig(startupProfile?.config);
-  const keyboardWalker = startupChain ? false : useKeyboardWalker(process.env, audit || smoke, simEnabled);
+  const startupCfg = migrateTelemetry(startupProfile?.config || {});
+  const startupNonLegacy = !simEnabled && !audit && !smoke && startupCfg.telemetry.mode !== 'native';
+  const keyboardWalker = startupNonLegacy ? false : useKeyboardWalker(process.env, audit || smoke, simEnabled);
   keyboardBackend = keyboardWalker && !smoke;
   engineRuntime = smoke ? null : keyboardWalker ? new RpmCombatRuntime({
     mapProvider: () => loadDefaultMap(),
@@ -501,28 +503,29 @@ const ready = app.whenReady().then(async () => {
     }
     return res;
   };
-  const reconnectToPid = async newPid => {
-    if (Date.now() < chainCooldownUntil) return false;
-    const pidCheck = validateGameProcessPid(newPid);
-    if (!pidCheck.valid) return false;
-    const build = ensurePidBuildVerified(newPid);
-    if (build && build.path && !build.supported) return false;
-    await engineRuntime?.close().catch(() => {});
-    stopLiveProvider();
-    reapStale({ pidFile: PIDFILE, rootDir: root, reconcileLive: true });
-    const activeCfg = activeNormalizedConfig();
-    await engineRuntime.connect(newPid, activeCfg || undefined);
-    chainSessionStartedAt = Date.now();
-    bootLegacyIfAllowed(activeCfg);
-    console.log('[chain] conectado pid=' + newPid);
-    return true;
-  };
-  if (channelBackend) {
+  const reconnectCoordinator = createReconnectCoordinator({
+    pidFile: PIDFILE,
+    rootDir: root,
+    validatePid: validateGameProcessPid,
+    verifyBuild: pid => ensurePidBuildVerified(pid),
+    closeRuntime: async () => { await engineRuntime?.close().catch(() => {}); },
+    stopAll: () => stopLiveProvider(),
+    reap: opts => reapStale(opts),
+    connectRuntime: async (pid, cfg) => {
+      await engineRuntime.connect(pid, cfg || undefined);
+      chainSessionStartedAt = Date.now();
+      console.log('[chain] conectado pid=' + pid);
+    },
+    bootLegacy: cfg => bootLegacyIfAllowed(cfg),
+    discover: () => discoverProcesses(),
+    pickPid: pids => selectPid(pids, process.env.PKA_PID),
+  });
+  if (channelBackend && startupCfg.telemetry.mode !== 'replay') {
     try {
       const pids = discoverProcesses();
       const pid = selectPid(pids, process.env.PKA_PID);
-      const ok = await reconnectToPid(pid);
-      if (!ok) throw Error('unsupported-or-invalid-pid');
+      const res = await reconnectCoordinator.reconnect(pid, activeNormalizedConfig());
+      if (!res.ok) throw Error(res.reason || 'unsupported-or-invalid-pid');
     } catch (error) {
       console.warn('[channel] auto-connect: ' + error.message);
     }
@@ -804,41 +807,23 @@ const ready = app.whenReady().then(async () => {
       }
       if (!audit && !simEnabled && engineRuntime && isChainModeActive()) {
         const cfg = activeNormalizedConfig();
-        const maxMin = Number(cfg?.telemetry?.maxSessionMin) || 20;
-        const cooldownMin = Number(cfg?.telemetry?.cooldownMin ?? 5);
-        if (engineRuntime.connected && chainSessionStartedAt > 0
-            && Date.now() - chainSessionStartedAt >= maxMin * 60000) {
-          chainSessionStartedAt = 0;
-          chainCooldownUntil = Date.now() + cooldownMin * 60000;
-          chainConnecting = true;
-          Promise.resolve().then(async () => {
-            await engineRuntime.close();
-            stopLiveProvider();
-            const msg = 'Sessao chain encerrada (teto ' + maxMin + ' min). Cooldown de ' + cooldownMin + ' min.';
+        Promise.resolve().then(async () => {
+          const outcome = await reconnectCoordinator.tick({
+            connected: engineRuntime.connected,
+            currentPid: engineRuntime.pid,
+            providerRunning: engineRuntime.adapter?.providerRunning !== false,
+            normalizedConfig: cfg,
+          });
+          if (outcome.action === 'cooldown-stop') {
+            chainSessionStartedAt = 0;
+            chainCooldownUntil = Date.now() + outcome.cooldownMin * 60000;
+            const msg = 'Sessao chain encerrada (teto ' + outcome.maxMin + ' min). Cooldown de ' + outcome.cooldownMin + ' min.';
             console.warn('[chain] ' + msg);
             if (window && !window.isDestroyed()) {
               window.webContents.send('pka:notice', { kind: 'warning', message: msg });
             }
-          }).catch(() => {}).finally(() => { chainConnecting = false; });
-        } else if (!chainConnecting && Date.now() >= chainCooldownUntil
-            && Date.now() - lastChainConnectAttempt >= 5000) {
-          lastChainConnectAttempt = Date.now();
-          chainConnecting = true;
-          Promise.resolve().then(async () => {
-            if (engineRuntime.connected && engineRuntime.pid) {
-              const alive = validateGameProcessPid(engineRuntime.pid);
-              if (alive.valid) return;
-              console.warn('[chain] PID do jogo encerrado (' + engineRuntime.pid + '); limpando sessao');
-              chainSessionStartedAt = 0;
-              await engineRuntime.close();
-              stopLiveProvider();
-            }
-            const pids = discoverProcesses();
-            if (!pids.length) return;
-            const pid = selectPid(pids, process.env.PKA_PID);
-            await reconnectToPid(pid);
-          }).catch(() => {}).finally(() => { chainConnecting = false; });
-        }
+          }
+        }).catch(() => {});
       }
       window.webContents.send('pka:snapshot', controller.snapshot());
     }, 1000);
